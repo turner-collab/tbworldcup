@@ -9,6 +9,9 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
    (server-side) by replacing the body with a fetch to your /notify endpoint.
 ============================================================================ */
 
+// Organizer password. Change this to whatever you want to hand out.
+const ORGANIZER_PASSWORD = "sharkthedog";
+
 /* ---------- Tournament data (2026 World Cup, all 48 teams) ---------- */
 const GROUPS = {
   A: ["Mexico", "South Korea", "South Africa", "Czechia"],
@@ -76,9 +79,9 @@ const THEMES = {
 };
 const DEFAULT_THEME = "goats";
 
-/* ---------- Storage layer: talks to the Supabase-backed API routes ----------
-   INDEX_KEY reads the derived index from GET /api/groups.
-   Group keys read/write a single row via /api/groups/:id. */
+/* ---------- Storage layer: in-browser (artifact play version) ----------
+   Uses Supabase-backed API routes. get/set hit /api/groups, patch does an
+   atomic server-side merge, del removes a group. */
 const INDEX_KEY = "wc:groups:index";
 const groupKey = (id) => `wc:group:${id}`;
 const idFromKey = (key) => key.startsWith("wc:group:") ? key.slice("wc:group:".length) : null;
@@ -101,14 +104,11 @@ const STORAGE = {
         return j.group || null;
       }
       return null;
-    } catch (e) {
-      console.error("STORAGE.get failed", e);
-      return null;
-    }
+    } catch (e) { console.error("STORAGE.get failed", e); return null; }
   },
   async set(key, value) {
     try {
-      if (key === INDEX_KEY) return true; // index is derived server-side; nothing to write
+      if (key === INDEX_KEY) return true; // derived server-side
       const id = idFromKey(key);
       if (id) {
         const r = await fetch(`/api/groups/${id}`, {
@@ -119,12 +119,30 @@ const STORAGE = {
         return r.ok;
       }
       return false;
-    } catch (e) {
-      console.error("STORAGE.set failed", e);
-      return false;
-    }
+    } catch (e) { console.error("STORAGE.set failed", e); return false; }
   },
   async listKeys() { return []; },
+  async del(key) {
+    const id = idFromKey(key);
+    if (!id) return false;
+    try {
+      const r = await fetch(`/api/groups/${id}`, { method: "DELETE" });
+      return r.ok;
+    } catch (e) { console.error("STORAGE.del failed", e); return false; }
+  },
+  // Atomic single-field change via the server PATCH endpoint.
+  async patch(id, payload) {
+    try {
+      const r = await fetch(`/api/groups/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) return null;
+      const j = await r.json();
+      return j.group || null;
+    } catch (e) { console.error("STORAGE.patch failed", e); return null; }
+  },
 };
 
 /* ---------- Notification stub (wire Twilio server-side here) ---------- */
@@ -153,6 +171,29 @@ function snakeOrder(numPlayers, totalPicks) {
   }
   return order;
 }
+// Fisher-Yates shuffle of [0..n-1] for a random first-round order.
+function shuffledIndices(n) {
+  const a = [...Array(n).keys()];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+// Snake draft built from a given first-round order (e.g. a random shuffle).
+function snakeOrderFrom(baseOrder, totalPicks) {
+  const order = [];
+  let round = 0;
+  while (order.length < totalPicks) {
+    const seq = round % 2 === 0 ? baseOrder : [...baseOrder].reverse();
+    for (const p of seq) {
+      if (order.length >= totalPicks) break;
+      order.push(p);
+    }
+    round++;
+  }
+  return order;
+}
 function uid() {
   return Math.random().toString(36).slice(2, 9);
 }
@@ -162,14 +203,18 @@ function usePolledGroup(id, { intervalMs = 4000 } = {}) {
   const [g, setG] = useState(null);
   const [notFound, setNotFound] = useState(false);
   const savingRef = React.useRef(false);
+  const localStampRef = React.useRef(0); // bumped on every local change
 
   const refresh = useCallback(async () => {
     if (savingRef.current) return;
+    const startStamp = localStampRef.current;
     const data = await STORAGE.get(groupKey(id));
+    // If a local change happened while this read was in flight, drop the result
+    // so we never overwrite fresher local state with a stale server copy.
+    if (startStamp !== localStampRef.current || savingRef.current) return;
     if (data === null) { setNotFound(true); return; }
     setNotFound(false);
     setG((prev) => {
-      // only replace if server copy differs, to limit re-renders
       if (prev && JSON.stringify(prev) === JSON.stringify(data)) return prev;
       return data;
     });
@@ -183,12 +228,24 @@ function usePolledGroup(id, { intervalMs = 4000 } = {}) {
 
   const save = useCallback(async (next) => {
     savingRef.current = true;
+    localStampRef.current += 1;
     setG(next);
     await STORAGE.set(groupKey(id), next);
     savingRef.current = false;
   }, [id]);
 
-  return { g, setG, notFound, save, refresh };
+  // Atomic single-field change via the server PATCH endpoint. The server
+  // returns the authoritative merged group, which we adopt locally.
+  const patch = useCallback(async (payload) => {
+    savingRef.current = true;
+    localStampRef.current += 1;
+    const updated = await STORAGE.patch(id, payload);
+    if (updated) setG(updated);
+    savingRef.current = false;
+    return updated;
+  }, [id]);
+
+  return { g, setG, notFound, save, patch, refresh };
 }
 // Strip everything but digits so formatting differences don't block login.
 function normPhone(s) {
@@ -205,6 +262,7 @@ export default function App() {
   const [index, setIndex] = useState(null); // [{id,name}]
   const [loading, setLoading] = useState(true);
   const [inviteId, setInviteId] = useState(null);
+  const [orgUnlocked, setOrgUnlocked] = useState(false); // organizer password gate
 
   const loadIndex = useCallback(async () => {
     const idx = (await STORAGE.get(INDEX_KEY)) || [];
@@ -226,8 +284,12 @@ export default function App() {
     <Shell>
       {route.name === "landing" && (
         <Landing
-          onOrganizer={() => setRoute({ name: "home" })}
+          onOrganizer={() => setRoute({ name: orgUnlocked ? "home" : "orgPassword" })}
           onPlayer={() => setRoute({ name: "login" })} />
+      )}
+      {route.name === "orgPassword" && (
+        <OrganizerPassword onBack={() => setRoute({ name: "landing" })}
+          onUnlock={() => { setOrgUnlocked(true); setRoute({ name: "home" }); }} />
       )}
       {route.name === "login" && (
         <PlayerLogin onBack={() => setRoute({ name: "landing" })}
@@ -240,21 +302,31 @@ export default function App() {
           onOpen={(id) => setRoute({ name: "playerView", id, phone: route.phone })} />
       )}
       {route.name === "playerView" && (
-        <PlayerView id={route.id} phone={route.phone}
-          onBack={() => setRoute({ name: "myGroups", phone: route.phone })} />
+        <PlayerView id={route.id} phone={route.phone} playerId={route.playerId}
+          onBack={() => route.fromGroup
+            ? setRoute({ name: "group", id: route.id })
+            : setRoute({ name: "myGroups", phone: route.phone })} />
       )}
       {route.name === "home" && (
         <Home index={index}
           onOpen={(id) => setRoute({ name: "group", id })}
           onNew={() => setRoute({ name: "new" })}
-          onExit={() => setRoute({ name: "landing" })} />
+          onExit={() => setRoute({ name: "landing" })}
+          onDelete={async (id) => {
+            await STORAGE.del(groupKey(id));
+            const idx = (await STORAGE.get(INDEX_KEY)) || [];
+            await STORAGE.set(INDEX_KEY, idx.filter((e) => e.id !== id));
+            await loadIndex();
+          }} />
       )}
       {route.name === "new" && (
         <NewGroup onCancel={() => setRoute({ name: "home" })}
           onCreated={async (id) => { await loadIndex(); setRoute({ name: "group", id }); }} />
       )}
       {route.name === "group" && (
-        <GroupView id={route.id} onBack={async () => { await loadIndex(); setRoute({ name: "home" }); }} />
+        <GroupView id={route.id}
+          onBack={async () => { await loadIndex(); setRoute({ name: "home" }); }}
+          onPlayAs={(playerId) => setRoute({ name: "playerView", id: route.id, playerId, fromGroup: true })} />
       )}
     </Shell>
   );
@@ -291,6 +363,30 @@ function Landing({ onOrganizer, onPlayer }) {
           </div>
         </div>
       </button>
+    </>
+  );
+}
+
+/* ---------- Organizer password gate ---------- */
+function OrganizerPassword({ onBack, onUnlock }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+
+  function submit() {
+    if (pw === ORGANIZER_PASSWORD) onUnlock();
+    else { setErr("That's not the right password."); }
+  }
+  return (
+    <>
+      <Header title="Organizer access" onBack={onBack}
+        sub="Enter the password to create and manage groups." />
+      <label style={lbl}>Password</label>
+      <input className="inp" type="password" placeholder="••••••••"
+        value={pw} onChange={(e) => { setPw(e.target.value); setErr(""); }}
+        onKeyDown={(e) => e.key === "Enter" && submit()} autoFocus />
+      {err && <p style={{ color: "#ff8095", fontSize: 13, marginTop: 8 }}>{err}</p>}
+      <button className="primary" onClick={submit}
+        style={{ width: "100%", marginTop: 16 }}>Continue</button>
     </>
   );
 }
@@ -433,7 +529,9 @@ function Header({ title, sub, onBack, right }) {
 }
 
 /* ---------- Home: list of draft groups ---------- */
-function Home({ index, onOpen, onNew, onExit }) {
+function Home({ index, onOpen, onNew, onExit, onDelete }) {
+  const [confirmId, setConfirmId] = useState(null);
+  const confirmGroup = index.find((g) => g.id === confirmId);
   return (
     <>
       <header style={{ paddingTop: 32, paddingBottom: 20, display: "flex",
@@ -460,21 +558,53 @@ function Home({ index, onOpen, onNew, onExit }) {
         </div>
       ) : (
         index.map((g) => (
-          <button key={g.id} onClick={() => onOpen(g.id)} className="row-card">
-            <div>
-              <div style={{ fontWeight: 700, fontSize: 17 }}>{g.name}</div>
-              <div style={{ opacity: 0.5, fontSize: 13, marginTop: 2 }}>
-                {g.players} players · {g.phase}
+          <div key={g.id} className="row-card" style={{ padding: 0, overflow: "hidden" }}>
+            <button onClick={() => onOpen(g.id)}
+              style={{ flex: 1, display: "flex", alignItems: "center",
+                justifyContent: "space-between", background: "transparent", border: "none",
+                color: "inherit", font: "inherit", cursor: "pointer", padding: 16, textAlign: "left" }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 17 }}>{g.name}</div>
+                <div style={{ opacity: 0.5, fontSize: 13, marginTop: 2 }}>
+                  {g.players} players · {g.phase}
+                </div>
               </div>
-            </div>
-            <span style={{ opacity: 0.4 }}>→</span>
-          </button>
+              <span style={{ opacity: 0.4 }}>→</span>
+            </button>
+            <button onClick={() => setConfirmId(g.id)} title="Delete group"
+              style={{ background: "transparent", border: "none", borderLeft: "1px solid #222d47",
+                color: "#ff8095", cursor: "pointer", padding: "0 16px", fontSize: 16,
+                alignSelf: "stretch" }}>🗑</button>
+          </div>
         ))
       )}
 
       <button onClick={onNew} className="primary" style={{ marginTop: 16, width: "100%" }}>
         + New draft group
       </button>
+
+      {confirmGroup && (
+        <div className="modal-bg" onClick={() => setConfirmId(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}
+            style={{ maxHeight: "none" }}>
+            <h2 style={{ font: "800 20px 'Space Grotesk', sans-serif", margin: "0 0 8px" }}>
+              Delete "{confirmGroup.name}"?
+            </h2>
+            <p style={{ opacity: 0.65, fontSize: 14, lineHeight: 1.5, margin: "0 0 18px" }}>
+              This permanently removes the group, its draft, and all results. This can't
+              be undone.
+            </p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="ghost" onClick={() => setConfirmId(null)}
+                style={{ flex: 1, padding: 14 }}>Cancel</button>
+              <button onClick={async () => { const id = confirmId; setConfirmId(null); await onDelete(id); }}
+                style={{ flex: 1, padding: 14, borderRadius: 14, border: "none",
+                  background: "#ff8095", color: "#0b1020", fontWeight: 800, fontSize: 15,
+                  cursor: "pointer", fontFamily: "inherit" }}>Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -483,6 +613,7 @@ function Home({ index, onOpen, onNew, onExit }) {
 function NewGroup({ onCancel, onCreated }) {
   const [name, setName] = useState("");
   const [players, setPlayers] = useState([{ id: uid(), name: "", phone: "" }]);
+  const [organizerId, setOrganizerId] = useState(null); // which player is "me"
   const [theme, setTheme] = useState(DEFAULT_THEME);
   const [mode, setMode] = useState("remote"); // remote | inperson
   const [when, setWhen] = useState("now"); // now | scheduled
@@ -492,7 +623,11 @@ function NewGroup({ onCancel, onCreated }) {
   const setP = (i, k, v) =>
     setPlayers((ps) => ps.map((p, j) => (j === i ? { ...p, [k]: v } : p)));
   const addP = () => setPlayers((ps) => [...ps, { id: uid(), name: "", phone: "" }]);
-  const rmP = (i) => setPlayers((ps) => ps.filter((_, j) => j !== i));
+  const rmP = (i) => setPlayers((ps) => {
+    const removed = ps[i];
+    if (removed && removed.id === organizerId) setOrganizerId(null);
+    return ps.filter((_, j) => j !== i);
+  });
 
   const valid = name.trim() && players.filter((p) => p.name.trim()).length >= 2
     && !(mode === "remote" && when === "scheduled" && !startAt);
@@ -501,19 +636,21 @@ function NewGroup({ onCancel, onCreated }) {
     setBusy(true);
     const clean = players.filter((p) => p.name.trim())
       .map((p) => ({ ...p, name: p.name.trim(), phone: p.phone.trim() }));
-    const order = snakeOrder(clean.length, ALL_TEAMS.length);
+    // Random draft order: shuffle player indices, then snake through them.
+    const shuffled = shuffledIndices(clean.length);
+    const order = snakeOrderFrom(shuffled, ALL_TEAMS.length);
     const id = uid();
-    // In-person: no invites needed, draft is ready immediately.
-    // Remote+Now: open for acceptances, draft starts when admin launches.
-    // Remote+Scheduled: starts at startAt.
     const scheduledStart = mode === "remote" && when === "scheduled"
       ? new Date(startAt).getTime() : null;
+    // Keep organizerId only if that player survived the cleanup.
+    const orgValid = clean.some((p) => p.id === organizerId) ? organizerId : null;
     const group = {
       id, name: name.trim(), players: clean, points: { ...DEFAULT_POINTS }, theme,
-      mode, scheduledStart,
+      mode, scheduledStart, organizerId: orgValid,
       accepted: {}, // playerId -> timestamp accepted (remote only)
-      started: mode === "inperson", // in-person is ready to draft right away
+      started: mode === "inperson",
       inPersonReady: false, // one-time rules gate for in-person
+      inPersonTurnReady: false, // per-turn tap-to-start gate for in-person
       order, pickIdx: 0, picks: [], // picks: {team, group, playerId, secs, at}
       results: {}, // matchId -> winner team name
       rivals: {}, // playerId -> rival playerId
@@ -535,22 +672,40 @@ function NewGroup({ onCancel, onCreated }) {
       <input className="inp" placeholder="e.g. Baker Family"
         value={name} onChange={(e) => setName(e.target.value)} />
 
-      <div style={{ ...lbl, marginTop: 24, display: "flex", justifyContent: "space-between" }}>
-        <span>Players · drafting in this order</span>
-      </div>
-      {players.map((p, i) => (
-        <div key={p.id} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-          <div style={{ width: 26, textAlign: "center", lineHeight: "44px",
-            opacity: 0.4, fontWeight: 700 }}>{i + 1}</div>
-          <input className="inp" style={{ flex: 1.3 }} placeholder="Name"
-            value={p.name} onChange={(e) => setP(i, "name", e.target.value)} />
-          <input className="inp" style={{ flex: 1 }} placeholder="Phone (optional)"
-            value={p.phone} onChange={(e) => setP(i, "phone", e.target.value)} />
-          {players.length > 1 && (
-            <button className="ghost" onClick={() => rmP(i)} style={{ width: 40 }}>✕</button>
-          )}
-        </div>
-      ))}
+      <div style={{ ...lbl, marginTop: 24 }}>Players</div>
+      <p style={{ fontSize: 12, opacity: 0.5, margin: "0 0 10px", lineHeight: 1.5 }}>
+        Draft order is randomized when you create the group. Check "This is me" on your
+        own row so you can also play.
+      </p>
+      {players.map((p, i) => {
+        const isMe = p.id === organizerId;
+        return (
+          <div key={p.id} style={{ ...card, padding: 12, marginBottom: 8 }}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input className="inp" style={{ flex: 1.3 }} placeholder="Name"
+                value={p.name} onChange={(e) => setP(i, "name", e.target.value)} />
+              <input className="inp" style={{ flex: 1 }} placeholder="Phone (optional)"
+                value={p.phone} onChange={(e) => setP(i, "phone", e.target.value)} />
+              {players.length > 1 && (
+                <button className="ghost" onClick={() => rmP(i)} style={{ width: 40 }}>✕</button>
+              )}
+            </div>
+            <button onClick={() => setOrganizerId(isMe ? null : p.id)}
+              disabled={!p.name.trim()}
+              style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8,
+                background: "transparent", border: "none", cursor: p.name.trim() ? "pointer" : "default",
+                color: isMe ? S.accent : S.ink, opacity: p.name.trim() ? 1 : 0.4,
+                fontFamily: "inherit", fontSize: 13, padding: 0 }}>
+              <span style={{ width: 18, height: 18, borderRadius: 5, flexShrink: 0,
+                border: `2px solid ${isMe ? S.accent : "#3a4566"}`,
+                background: isMe ? S.accent : "transparent",
+                display: "grid", placeItems: "center", color: "#0b1020",
+                fontSize: 12, fontWeight: 800 }}>{isMe ? "✓" : ""}</span>
+              <span style={{ fontWeight: isMe ? 700 : 500 }}>This is me (the organizer)</span>
+            </button>
+          </div>
+        );
+      })}
       <button className="ghost" onClick={addP} style={{ width: "100%", marginTop: 4 }}>
         + Add player
       </button>
@@ -657,11 +812,34 @@ function Radio({ on }) {
   );
 }
 
+/* Organizer-as-player control: jump into your own player view */
+function OrganizerPlayBar({ g, onPlay }) {
+  const me = g.players.find((p) => p.id === g.organizerId);
+  if (!me) return (
+    <div style={{ ...card, marginBottom: 14, fontSize: 13, opacity: 0.7 }}>
+      You didn't mark which player is you. To also play, recreate the group and check
+      "This is me" on your own row.
+    </div>
+  );
+  return (
+    <div style={{ ...card, marginBottom: 14, borderColor: S.accent }}>
+      <div style={{ ...lbl, marginBottom: 6 }}>You're the organizer</div>
+      <p style={{ fontSize: 13, opacity: 0.65, margin: "0 0 10px", lineHeight: 1.5 }}>
+        Watch acceptances and results here. Tap in as a player anytime to draft and
+        track your own roster.
+      </p>
+      <button className="primary" onClick={() => onPlay(me.id)} style={{ width: "100%" }}>
+        Play as {me.name}
+      </button>
+    </div>
+  );
+}
+
 /* ---------- Group view (tabs: Draft / Matchups / Standings) ---------- */
-function GroupView({ id, onBack }) {
+function GroupView({ id, onBack, onPlayAs }) {
   const [tab, setTab] = useState("draft");
   const [history, setHistory] = useState(false);
-  const { g, notFound, save } = usePolledGroup(id);
+  const { g, notFound, save, patch } = usePolledGroup(id);
 
   if (notFound) return (
     <div style={{ ...card, textAlign: "center", marginTop: 32 }}>
@@ -679,6 +857,12 @@ function GroupView({ id, onBack }) {
         sub={drafting ? `Pick ${g.picks.length + 1} of ${ALL_TEAMS.length}` : "All teams drafted"}
         right={<button className="ghost" onClick={() => setHistory(true)}
           style={{ marginTop: 4, fontSize: 13 }}>Draft log</button>} />
+
+      {/* Organizer-as-player: only for remote drafts (in-person is one shared phone) */}
+      {g.mode !== "inperson" && (
+        <OrganizerPlayBar g={g} onPlay={(playerId) => onPlayAs(playerId)} />
+      )}
+
       <nav style={{ display: "flex", gap: 5, marginBottom: 18 }}>
         {[["draft", "Draft"], ["matchups", "Matchups"],
           ["competition", "Competition"], ["standings", "Standings"]]
@@ -690,10 +874,10 @@ function GroupView({ id, onBack }) {
       </nav>
       {tab === "draft" && (
         draftIsOpen(g)
-          ? <DraftTab g={g} save={save} />
-          : <AdminLobby g={g} save={save} />
+          ? <DraftTab g={g} save={save} patch={patch} />
+          : <AdminLobby g={g} save={save} patch={patch} />
       )}
-      {tab === "matchups" && <MatchupsTab g={g} save={save} />}
+      {tab === "matchups" && <MatchupsTab g={g} save={save} patch={patch} />}
       {tab === "competition" && <PlayerRivals g={g} meId={null} />}
       {tab === "standings" && <StandingsTab g={g} />}
       {history && <DraftHistory g={g} onClose={() => setHistory(false)} />}
@@ -742,7 +926,7 @@ function InviteLink({ g }) {
 }
 
 /* ---------- Admin pre-draft lobby (remote) / rules gate (in-person) ---------- */
-function AdminLobby({ g, save }) {
+function AdminLobby({ g, save, patch }) {
   const [, tick] = useState(0);
   useEffect(() => {
     if (!g.scheduledStart) return;
@@ -758,21 +942,28 @@ function AdminLobby({ g, save }) {
           In-person draft
         </h2>
         <p style={{ fontSize: 14, lineHeight: 1.55, opacity: 0.8, margin: "0 0 12px" }}>
-          Pass this phone around the room. On each turn, the player on the clock taps
-          their team — <strong>the pick clock runs while they decide</strong>. Fastest
-          total picker earns +{RIVAL.speedFastest}, slowest loses {Math.abs(RIVAL.speedSlowest)}.
+          Pass this phone around the room. Before each turn, the player on the clock taps
+          to start — <strong>the pick clock only runs while the phone is in their hands</strong>.
+          Fastest total picker earns +{RIVAL.speedFastest}, slowest loses {Math.abs(RIVAL.speedSlowest)}.
         </p>
-        <div style={{ ...lbl }}>Draft order</div>
+        <div style={{ ...lbl }}>Draft order (randomized)</div>
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
-          {g.players.map((p, i) => (
-            <span key={p.id} style={{ fontSize: 12.5, padding: "5px 10px", borderRadius: 999,
-              background: S.card2, fontWeight: 600 }}>{i + 1}. {p.name}</span>
+          {g.order.slice(0, g.players.length).map((pi, i) => (
+            <span key={i} style={{ fontSize: 12.5, padding: "5px 10px", borderRadius: 999,
+              background: i === 0 ? S.accent : S.card2,
+              color: i === 0 ? "#0b1020" : S.ink,
+              fontWeight: i === 0 ? 800 : 600 }}>
+              {i + 1}. {g.players[pi]?.name}
+            </span>
           ))}
         </div>
+        <p style={{ fontSize: 12, opacity: 0.5, margin: "-6px 0 14px" }}>
+          Snake order — it reverses each round, so the last picker goes back-to-back.
+        </p>
         <div style={{ ...lbl }}>Twist · {theme.label}</div>
         <p style={{ fontSize: 13, opacity: 0.65, margin: "0 0 16px" }}>{theme.blurb}</p>
         <button className="primary" style={{ width: "100%" }}
-          onClick={() => save({ ...g, inPersonReady: true })}>
+          onClick={() => patch({ op: "inPersonReady" })}>
           Start draft →
         </button>
       </div>
@@ -785,7 +976,7 @@ function AdminLobby({ g, save }) {
   const enoughToStart = acceptedCount >= 2;
   const countdown = g.scheduledStart ? g.scheduledStart - Date.now() : null;
 
-  async function launch() { await save({ ...g, started: true }); }
+  async function launch() { await patch({ op: "launch" }); }
 
   return (
     <>
@@ -845,7 +1036,7 @@ function AdminLobby({ g, save }) {
 }
 
 /* ---------- Draft board (shared by admin in-person and player remote) ---------- */
-function DraftBoard({ g, save, canPick }) {
+function DraftBoard({ g, save, patch, canPick }) {
   const [stageFilter, setStageFilter] = useState("all");
   const taken = useMemo(() => new Set(g.picks.map((p) => p.team)), [g.picks]);
   const done = g.picks.length >= ALL_TEAMS.length;
@@ -855,31 +1046,91 @@ function DraftBoard({ g, save, canPick }) {
   const rosterCount = (pid) => g.picks.filter((p) => p.playerId === pid).length;
 
   // Per-turn live clock. Reset whenever the pick index changes.
+  const inPerson = g.mode === "inperson";
   const [turnStart, setTurnStart] = useState(() => Date.now());
   const [now, setNow] = useState(() => Date.now());
-  useEffect(() => { setTurnStart(Date.now()); setNow(Date.now()); }, [g.pickIdx]);
+  const [picking, setPicking] = useState(false);
+  // In-person: each turn waits for the player to tap "start" before the clock
+  // runs or the board is interactive. Resets every turn.
+  const [turnStarted, setTurnStarted] = useState(!inPerson);
   useEffect(() => {
-    if (done) return;
+    setTurnStarted(!inPerson);
+    setTurnStart(Date.now());
+    setNow(Date.now());
+    setPicking(false);
+  }, [g.pickIdx, inPerson]);
+  useEffect(() => {
+    if (done || !turnStarted) return;
     const t = setInterval(() => setNow(Date.now()), 250);
     return () => clearInterval(t);
-  }, [done]);
-  const elapsed = Math.max(0, Math.floor((now - turnStart) / 1000));
+  }, [done, turnStarted]);
+  const elapsed = turnStarted ? Math.max(0, Math.floor((now - turnStart) / 1000)) : 0;
+
+  function startTurn() {
+    setTurnStart(Date.now());
+    setNow(Date.now());
+    setTurnStarted(true);
+  }
+
+  // In-person tap-to-start gate before each pick.
+  if (inPerson && !done && !turnStarted && canPick) {
+    return (
+      <div style={{ minHeight: "70vh", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center", textAlign: "center",
+        padding: "24px 16px" }}>
+        <div style={{ fontSize: 14, opacity: 0.5, textTransform: "uppercase",
+          letterSpacing: "0.16em", marginBottom: 18 }}>Pass the phone to</div>
+        <div style={{
+          font: "800 clamp(48px, 18vw, 104px)/0.95 'Space Grotesk', sans-serif",
+          letterSpacing: "-0.03em", color: S.accent, marginBottom: 6,
+          wordBreak: "break-word" }}>
+          {curPlayer?.name}
+        </div>
+        <div style={{ font: "700 clamp(20px, 6vw, 30px)/1 'Space Grotesk', sans-serif",
+          opacity: 0.85, marginBottom: 28 }}>
+          it's your turn
+        </div>
+        <p style={{ opacity: 0.5, fontSize: 13.5, margin: "0 0 28px", lineHeight: 1.5,
+          maxWidth: 320 }}>
+          Pick {g.picks.length + 1} of {ALL_TEAMS.length}. Your clock starts the
+          moment you tap — be quick, fastest total drafter wins a point.
+        </p>
+        <button className="primary" onClick={startTurn}
+          style={{ width: "100%", maxWidth: 360, padding: "16px",
+            fontSize: 17 }}>
+          Start my pick →
+        </button>
+      </div>
+    );
+  }
 
   async function pick(team) {
-    if (taken.has(team.name) || done || !curPlayer || !canPick) return;
+    if (taken.has(team.name) || done || !curPlayer || !canPick || picking) return;
+    setPicking(true);
     const secs = Math.max(0, (Date.now() - turnStart) / 1000);
-    const draftTime = { ...(g.draftTime || {}) };
-    draftTime[curPlayer.id] = (draftTime[curPlayer.id] || 0) + secs;
-    const next = {
-      ...g,
-      picks: [...g.picks, { team: team.name, group: team.group,
-        playerId: curPlayer.id, secs: Math.round(secs * 10) / 10, at: Date.now() }],
-      pickIdx: g.pickIdx + 1,
-      draftTime,
-    };
-    await save(next);
-    const ni = next.order[next.pickIdx];
-    if (ni != null) NOTIFY.draftTurn(next.players[ni], next);
+    if (patch) {
+      // Atomic server-side append; the server enforces turn + not-taken.
+      const updated = await patch({ op: "pick", playerId: curPlayer.id,
+        team: team.name, group: team.group, secs });
+      if (updated) {
+        const ni = updated.order[updated.pickIdx];
+        if (ni != null) NOTIFY.draftTurn(updated.players[ni], updated);
+      }
+    } else {
+      const draftTime = { ...(g.draftTime || {}) };
+      draftTime[curPlayer.id] = (draftTime[curPlayer.id] || 0) + secs;
+      const next = {
+        ...g,
+        picks: [...g.picks, { team: team.name, group: team.group,
+          playerId: curPlayer.id, secs: Math.round(secs * 10) / 10, at: Date.now() }],
+        pickIdx: g.pickIdx + 1,
+        draftTime,
+      };
+      await save(next);
+      const ni = next.order[next.pickIdx];
+      if (ni != null) NOTIFY.draftTurn(next.players[ni], next);
+    }
+    setPicking(false);
   }
 
   const visibleGroups = stageFilter === "all"
@@ -974,12 +1225,12 @@ function DraftBoard({ g, save, canPick }) {
 }
 
 /* Admin draft tab — admin device can always pick (in-person pass-around). */
-function DraftTab({ g, save }) {
-  return <DraftBoard g={g} save={save} canPick={true} />;
+function DraftTab({ g, save, patch }) {
+  return <DraftBoard g={g} save={save} patch={patch} canPick={true} />;
 }
 
 /* Player live draft — can only pick on their turn. */
-function LiveDraft({ g, me, save, onBack, myTurn, pname }) {
+function LiveDraft({ g, me, save, patch, onBack, myTurn, pname }) {
   return (
     <>
       <Header title={g.name} onBack={onBack} sub={`Playing as ${me?.name}`} />
@@ -993,7 +1244,7 @@ function LiveDraft({ g, me, save, onBack, myTurn, pname }) {
           </p>
         </div>
       )}
-      <DraftBoard g={g} save={save} canPick={myTurn} />
+      <DraftBoard g={g} save={save} patch={patch} canPick={myTurn} />
     </>
   );
 }
@@ -1033,7 +1284,7 @@ function groupStageFixtures() {
   }
   return games;
 }
-function MatchupsTab({ g, save }) {
+function MatchupsTab({ g, save, patch }) {
   const ownerOf = useCallback(
     (team) => g.picks.find((p) => p.team === team)?.playerId, [g.picks]);
   const pname = (pid) => g.players.find((p) => p.id === pid)?.name || "—";
@@ -1046,10 +1297,13 @@ function MatchupsTab({ g, save }) {
   const koGames = g.koGames || [];
 
   async function setWinner(matchId, team) {
-    const results = { ...g.results };
-    if (results[matchId] === team) delete results[matchId];
-    else results[matchId] = team;
-    await save({ ...g, results });
+    const toggleOff = g.results[matchId] === team;
+    if (patch) await patch({ op: "setResult", matchId, winner: toggleOff ? null : team });
+    else {
+      const results = { ...g.results };
+      if (toggleOff) delete results[matchId]; else results[matchId] = team;
+      await save({ ...g, results });
+    }
   }
   async function addKo() {
     if (!koHome || !koAway || koHome === koAway) return;
@@ -1488,10 +1742,10 @@ function RulesGate({ g, onStart, onBack }) {
     </>
   );
 }
-function PlayerView({ id, phone, onBack }) {
+function PlayerView({ id, phone, playerId, onBack }) {
   const [page, setPage] = useState("roster");
   const [showHistory, setShowHistory] = useState(false);
-  const { g, notFound: missing, save } = usePolledGroup(id);
+  const { g, notFound: missing, save, patch } = usePolledGroup(id);
 
   if (missing) return (
     <div style={{ ...card, textAlign: "center", marginTop: 32 }}>
@@ -1501,7 +1755,9 @@ function PlayerView({ id, phone, onBack }) {
   );
   if (!g) return <Spinner />;
 
-  const me = g.players.find((p) => normPhone(p.phone) === phone);
+  const me = playerId
+    ? g.players.find((p) => p.id === playerId)
+    : g.players.find((p) => normPhone(p.phone) === phone);
   const myTeams = g.picks.filter((p) => p.playerId === me?.id).map((p) => p.team);
   const myTeamSet = new Set(myTeams);
   const ownerOf = (team) => g.picks.find((p) => p.team === team)?.playerId;
@@ -1512,16 +1768,16 @@ function PlayerView({ id, phone, onBack }) {
   const seenRules = !!(g.seenRules || {})[me?.id];
 
   async function setRival(rivalId) {
-    if ((g.rivals || {})[me.id]) return; // already locked, never overwrite
+    if ((g.rivals || {})[me.id]) return; // already locked
     if (!rivalId) return;
-    await save({ ...g, rivals: { ...(g.rivals || {}), [me.id]: rivalId } });
+    await patch({ op: "setRival", playerId: me.id, rivalId });
   }
   async function accept() {
     if ((g.accepted || {})[me.id]) return;
-    await save({ ...g, accepted: { ...(g.accepted || {}), [me.id]: Date.now() } });
+    await patch({ op: "accept", playerId: me.id });
   }
   async function markRulesSeen() {
-    await save({ ...g, seenRules: { ...(g.seenRules || {}), [me.id]: true } });
+    await patch({ op: "seenRules", playerId: me.id });
   }
 
   // PHASE 1: remote, not yet accepted -> accept screen
@@ -1540,7 +1796,7 @@ function PlayerView({ id, phone, onBack }) {
       return <RulesGate g={g} onStart={markRulesSeen} onBack={onBack} />;
     }
     return (
-      <LiveDraft g={g} me={me} save={save} onBack={onBack}
+      <LiveDraft g={g} me={me} save={save} patch={patch} onBack={onBack}
         myTurn={myTurn} pname={pname} />
     );
   }
