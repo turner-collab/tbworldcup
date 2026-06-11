@@ -4,7 +4,7 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 /* ============================================================================
    WORLD CUP DRAFT — single-file app
    Persistence: window.storage (artifact KV). Swap STORAGE.* for a real
-   backend (fetch to your API) when you host it; the rest of the app is agnostic.
+   backend (fetch to your API) when you hst it; the rest of the app is agnostic.
    Notifications: NOTIFY.draftTurn() is a stub that logs. Wire Twilio there
    (server-side) by replacing the body with a fetch to your /notify endpoint.
 ============================================================================ */
