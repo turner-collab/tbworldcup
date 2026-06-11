@@ -117,6 +117,10 @@ const STORAGE = {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ group: value }),
         });
+        if (!r.ok) {
+          const detail = await r.text().catch(() => "");
+          console.error(`STORAGE.set failed: ${r.status} ${detail}`);
+        }
         return r.ok;
       }
       return false;
@@ -220,6 +224,7 @@ function usePolledGroup(id, { intervalMs = 4000 } = {}) {
   const [notFound, setNotFound] = useState(false);
   const savingRef = React.useRef(false);
   const localStampRef = React.useRef(0); // bumped on every local change
+  const missCountRef = React.useRef(0); // consecutive null reads
 
   const refresh = useCallback(async () => {
     if (savingRef.current) return;
@@ -228,7 +233,18 @@ function usePolledGroup(id, { intervalMs = 4000 } = {}) {
     // If a local change happened while this read was in flight, drop the result
     // so we never overwrite fresher local state with a stale server copy.
     if (startStamp !== localStampRef.current || savingRef.current) return;
-    if (data === null) { setNotFound(true); return; }
+    if (data === null) {
+      // Tolerate transient misses (write-consistency lag, network blips).
+      // Only declare the group missing after several consecutive null reads,
+      // and never if we already have it loaded.
+      missCountRef.current += 1;
+      setG((prev) => {
+        if (!prev && missCountRef.current >= 3) setNotFound(true);
+        return prev;
+      });
+      return;
+    }
+    missCountRef.current = 0;
     setNotFound(false);
     setG((prev) => {
       if (prev && JSON.stringify(prev) === JSON.stringify(data)) return prev;
@@ -732,8 +748,10 @@ function NewGroup({ onCancel, onCreated }) {
   const valid = name.trim() && players.filter((p) => p.name.trim()).length >= 2
     && !(mode === "remote" && when === "scheduled" && !startAt);
 
+  const [err, setErr] = useState("");
+
   async function create() {
-    setBusy(true);
+    setBusy(true); setErr("");
     const clean = players.filter((p) => p.name.trim())
       .map((p) => ({ ...p, name: p.name.trim(), phone: p.phone.trim() }));
     // Random draft order: shuffle player indices, then snake through them.
@@ -759,10 +777,31 @@ function NewGroup({ onCancel, onCreated }) {
       draftReady: {}, // playerId -> timestamp once they tap START DRAFTING
       createdAt: Date.now(), shareLink: "",
     };
-    await STORAGE.set(groupKey(id), group);
+    const ok = await STORAGE.set(groupKey(id), group);
+    if (!ok) {
+      setBusy(false);
+      setErr("Couldn't save the group to the server. Your changes weren't lost — "
+        + "check your connection and try again. If this keeps happening, the database "
+        + "connection may need attention.");
+      return;
+    }
+    // Verify the write is readable before navigating, so we never land on a
+    // group view that can't load. Retry the read briefly for write consistency.
+    let confirmed = null;
+    for (let i = 0; i < 4 && !confirmed; i++) {
+      confirmed = await STORAGE.get(groupKey(id));
+      if (!confirmed) await new Promise((r) => setTimeout(r, 350));
+    }
+    if (!confirmed) {
+      setBusy(false);
+      setErr("The group saved but didn't come back when we re-read it. Give it a moment "
+        + "and try opening it from the group list.");
+      return;
+    }
     const idx = (await STORAGE.get(INDEX_KEY)) || [];
     idx.push({ id, name: group.name, players: clean.length, phase: "Setup" });
     await STORAGE.set(INDEX_KEY, idx);
+    setBusy(false);
     onCreated(id);
   }
 
@@ -891,6 +930,10 @@ function NewGroup({ onCancel, onCreated }) {
         style={{ width: "100%", marginTop: 24, opacity: valid && !busy ? 1 : 0.4 }}>
         {busy ? "Creating…" : mode === "inperson" ? "Create & draft" : "Create & invite"}
       </button>
+      {err && (
+        <p style={{ color: "#ff8095", fontSize: 13, marginTop: 10, lineHeight: 1.5,
+          textAlign: "center" }}>{err}</p>
+      )}
       {!valid && (
         <p style={{ fontSize: 12, opacity: 0.5, textAlign: "center", marginTop: 8 }}>
           {mode === "remote" && when === "scheduled" && !startAt
