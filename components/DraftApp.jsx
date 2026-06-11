@@ -148,13 +148,16 @@ const STORAGE = {
     } catch (e) { console.error("STORAGE.patch failed", e); return null; }
   },
   // Server-side phone lookup across all groups (robust login).
+  // Returns null (not []) when the endpoint is unavailable/wrong-shaped, so the
+  // caller can tell "no match" apart from "endpoint not deployed".
   async findByPhone(phone) {
     try {
       const r = await fetch(`/api/groups?phone=${encodeURIComponent(phone)}`, { cache: "no-store" });
-      if (!r.ok) return [];
+      if (!r.ok) return null;
       const j = await r.json();
-      return j.groups || [];
-    } catch (e) { console.error("STORAGE.findByPhone failed", e); return []; }
+      if (!j || !Array.isArray(j.groups)) return null; // old route returned {index}, not {groups}
+      return j.groups;
+    } catch (e) { console.error("STORAGE.findByPhone failed", e); return null; }
   },
 };
 
@@ -500,9 +503,11 @@ function PlayerLogin({ onBack, onFound, inviteId }) {
     }
     // Robust server-side lookup when available (deploy); else fall back to index loop.
     let found = false;
-    if (STORAGE.findByPhone) {
-      const groups = await STORAGE.findByPhone(np);
-      found = groups.length > 0;
+    const viaServer = STORAGE.findByPhone ? await STORAGE.findByPhone(np) : null;
+    if (Array.isArray(viaServer)) {
+      // Endpoint answered. Empty array = genuinely no match, but still try the
+      // index loop as a backstop in case of any server-side normalization gap.
+      found = viaServer.length > 0;
     }
     if (!found) {
       const idx = (await STORAGE.get(INDEX_KEY)) || [];
@@ -551,7 +556,7 @@ function PlayerGroups({ phone, onBack, onOpen }) {
       let entries = null;
       if (STORAGE.findByPhone) {
         const groups = await STORAGE.findByPhone(phone);
-        if (groups.length) entries = groups.map((x) => ({ id: x.id }));
+        if (Array.isArray(groups) && groups.length) entries = groups.map((x) => ({ id: x.id }));
       }
       if (!entries) {
         entries = (await STORAGE.get(INDEX_KEY)) || [];
