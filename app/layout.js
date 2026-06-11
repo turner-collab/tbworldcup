@@ -1,6 +1,6 @@
 export const metadata = {
-  title: "World Cup Draft Room",
-  description: "Draft national teams, track matchups, win the bracket.",
+  title: "Jingoism",
+  description: "Rabid Support For Every Nation — 2026 World Cup draft.",
 };
 
 export default function RootLayout({ children }) {
