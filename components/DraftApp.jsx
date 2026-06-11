@@ -10,7 +10,7 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 ============================================================================ */
 
 // Organizer password. Change this to whatever you want to hand out.
-const ORGANIZER_PASSWORD = "sharkthedog";
+const ORGANIZER_PASSWORD = "worldcup2026";
 
 /* ---------- Tournament data (2026 World Cup, all 48 teams) ---------- */
 const GROUPS = {
@@ -337,13 +337,12 @@ function Landing({ onOrganizer, onPlayer }) {
   return (
     <>
       <header style={{ paddingTop: 48, paddingBottom: 28 }}>
+        <h1 style={{ font: "800 46px/0.95 'Space Grotesk', sans-serif",
+          letterSpacing: "-0.03em", margin: 0 }}>Jingoism</h1>
+        <p style={{ fontSize: 16, fontWeight: 600, marginTop: 12, marginBottom: 0,
+          opacity: 0.9 }}>Rabid Support For Every Nation</p>
         <div style={{ fontSize: 13, letterSpacing: "0.18em", textTransform: "uppercase",
-          color: S.accent, fontWeight: 700 }}>2026 World Cup</div>
-        <h1 style={{ font: "800 38px/1 'Space Grotesk', sans-serif",
-          letterSpacing: "-0.03em", margin: "8px 0 0" }}>Draft Room</h1>
-        <p style={{ opacity: 0.55, fontSize: 15, marginTop: 12 }}>
-          Draft nations, track every matchup, win the bracket.
-        </p>
+          color: S.accent, fontWeight: 700, marginTop: 8 }}>2026 World Cup</div>
       </header>
       <button onClick={onPlayer} className="big-choice" style={{ borderColor: S.accent }}>
         <span style={{ fontSize: 28 }}>📱</span>
@@ -874,7 +873,9 @@ function GroupView({ id, onBack, onPlayAs }) {
       </nav>
       {tab === "draft" && (
         draftIsOpen(g)
-          ? <DraftTab g={g} save={save} patch={patch} />
+          ? (g.mode === "inperson"
+              ? <DraftTab g={g} save={save} patch={patch} />
+              : <DraftBoard g={g} save={save} patch={patch} canPick={false} spectating />)
           : <AdminLobby g={g} save={save} patch={patch} />
       )}
       {tab === "matchups" && <MatchupsTab g={g} save={save} patch={patch} />}
@@ -894,7 +895,7 @@ function InviteLink({ g }) {
   async function share() {
     try {
       if (navigator.share) {
-        await navigator.share({ title: `${g.name} — World Cup Draft`,
+        await navigator.share({ title: `${g.name} — Jingoism`,
           text: `Join my World Cup draft "${g.name}"`, url });
         return;
       }
@@ -1036,7 +1037,7 @@ function AdminLobby({ g, save, patch }) {
 }
 
 /* ---------- Draft board (shared by admin in-person and player remote) ---------- */
-function DraftBoard({ g, save, patch, canPick }) {
+function DraftBoard({ g, save, patch, canPick, spectating }) {
   const [stageFilter, setStageFilter] = useState("all");
   const taken = useMemo(() => new Set(g.picks.map((p) => p.team)), [g.picks]);
   const done = g.picks.length >= ALL_TEAMS.length;
@@ -1138,6 +1139,16 @@ function DraftBoard({ g, save, patch, canPick }) {
 
   return (
     <>
+      {spectating && !done && (
+        <div style={{ ...card, marginBottom: 12, borderColor: S.accent,
+          display: "flex", gap: 10, alignItems: "center" }}>
+          <span style={{ fontSize: 18 }}>👀</span>
+          <div style={{ fontSize: 13, opacity: 0.8, lineHeight: 1.4 }}>
+            You're watching live. Players draft on their own phones — to make your own
+            picks, tap <strong>Play as you</strong> at the top.
+          </div>
+        </div>
+      )}
       {!done ? (
         <div style={{ ...card, borderColor: canPick ? S.accent : "#222d47", display: "flex",
           alignItems: "center", gap: 14 }}>
@@ -1711,40 +1722,109 @@ function fmtCountdown(ms) {
 /* Phase 3a: one-time rules gate before a player's first pick */
 function RulesGate({ g, onStart, onBack }) {
   const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
+  const row = (label, val) => (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline",
+      padding: "7px 0", borderBottom: "1px solid #1c2540" }}>
+      <span style={{ fontSize: 13.5, opacity: 0.8 }}>{label}</span>
+      <span style={{ fontWeight: 800, fontSize: 14, color: S.accent,
+        fontVariantNumeric: "tabular-nums" }}>{val}</span>
+    </div>
+  );
   return (
     <>
-      <Header title={g.name} onBack={onBack} sub="Before you draft" />
+      <Header title={g.name} onBack={onBack} sub="How scoring works" />
+
+      {/* Prominent active-twist callout */}
+      <div style={{ borderRadius: 16, padding: "16px 18px", marginBottom: 14,
+        background: "linear-gradient(135deg, rgba(36,152,218,0.22), rgba(41,89,146,0.22))",
+        border: `1.5px solid ${S.accent}` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <span style={{ fontSize: 20 }}>⚡</span>
+          <span style={{ fontSize: 11.5, textTransform: "uppercase", letterSpacing: "0.14em",
+            fontWeight: 800, color: S.accent }}>Special rule in play</span>
+        </div>
+        <div style={{ font: "800 19px 'Space Grotesk', sans-serif", marginBottom: 4 }}>
+          {theme.label}
+        </div>
+        <div style={{ fontSize: 13.5, lineHeight: 1.5, opacity: 0.9 }}>
+          {theme.blurb} <strong style={{ color: S.accent }}>+{theme.amount} points</strong> each
+          time it happens.
+        </div>
+      </div>
+
       <div style={{ ...card, marginBottom: 12 }}>
-        <h2 style={{ font: "800 22px 'Space Grotesk', sans-serif", margin: "0 0 10px" }}>
-          You're up soon — read this first
+        <h2 style={{ font: "800 20px 'Space Grotesk', sans-serif", margin: "0 0 4px" }}>
+          The basics
         </h2>
-        <p style={{ fontSize: 14, lineHeight: 1.55, opacity: 0.8, margin: "0 0 12px" }}>
-          You'll draft national teams one at a time. When you tap Start, the board
-          appears and <strong>your pick clock begins</strong>. Across the whole draft,
-          the fastest total picker earns <strong>+{RIVAL.speedFastest}</strong> and the
-          slowest loses <strong>{Math.abs(RIVAL.speedSlowest)}</strong> — so don't dawdle.
+        <p style={{ fontSize: 13.5, lineHeight: 1.55, opacity: 0.8, margin: "0 0 14px" }}>
+          You draft national teams. You earn points every time one of your teams
+          <strong> wins a match</strong>. The further into the tournament, the more each
+          win is worth:
         </p>
-        <div style={{ ...lbl, marginTop: 4 }}>Quick scoring</div>
-        <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 13.5, lineHeight: 1.6,
-          opacity: 0.8 }}>
-          <li>Win points rise each round: group {g.points.group} up to final {g.points.final}.</li>
-          <li>Fewer teams on your roster means more points per win.</li>
-          <li>Twist — {theme.label}: {theme.blurb}</li>
-          <li>Pick a rival after the draft for bonus points beating them.</li>
+        <div style={{ marginBottom: 14 }}>
+          {row("Group stage win", `${g.points.group} pt`)}
+          {row("Round of 32 win", `${g.points.r32} pts`)}
+          {row("Round of 16 win", `${g.points.r16} pts`)}
+          {row("Quarterfinal win", `${g.points.qf} pts`)}
+          {row("Semifinal win", `${g.points.sf} pts`)}
+          {row("Final win (champion)", `${g.points.final} pts`)}
+        </div>
+        <div style={{ ...lbl }}>Also worth knowing</div>
+        <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 13.5, lineHeight: 1.7,
+          opacity: 0.82 }}>
+          <li>Fewer teams on your roster = more points per win (it's balanced).</li>
+          <li>After the draft you pick a <strong>rival</strong> — beat them for bonus points.</li>
+          <li>The <strong>fastest</strong> overall drafter earns +{RIVAL.speedFastest}, the
+            slowest loses {Math.abs(RIVAL.speedSlowest)}. Don't dawdle on your picks.</li>
         </ul>
       </div>
+
       <button className="primary" onClick={onStart} style={{ width: "100%" }}>
-        Start my pick →
+        Got it — start my pick →
       </button>
       <p style={{ fontSize: 12, opacity: 0.45, textAlign: "center", marginTop: 8 }}>
-        You'll only see this once. Later picks start the moment it's your turn.
+        Your pick clock starts when you tap.
       </p>
     </>
+  );
+}
+
+/* Big "YOU'RE UP!" gate shown at the start of every one of a player's turns. */
+function YoureUp({ g, me, onStart, onBack }) {
+  const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
+  const myCount = g.picks.filter((p) => p.playerId === me?.id).length;
+  return (
+    <div style={{ minHeight: "70vh", display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", textAlign: "center",
+      padding: "24px 16px" }}>
+      <div style={{ fontSize: 15, opacity: 0.6, textTransform: "uppercase",
+        letterSpacing: "0.16em", marginBottom: 14 }}>{me?.name}</div>
+      <div style={{
+        font: "800 clamp(54px, 17vw, 110px)/0.9 'Space Grotesk', sans-serif",
+        letterSpacing: "-0.03em", color: S.accent, marginBottom: 10 }}>
+        YOU'RE UP!
+      </div>
+      <p style={{ fontSize: 15, opacity: 0.8, margin: "0 0 6px", maxWidth: 320, lineHeight: 1.5 }}>
+        Pick {g.picks.length + 1} of {ALL_TEAMS.length} — you're drafting your
+        {myCount === 0 ? " first" : ` #${myCount + 1}`} team.
+      </p>
+      <div style={{ fontSize: 12.5, opacity: 0.6, margin: "8px 0 26px", maxWidth: 320,
+        lineHeight: 1.5, padding: "8px 12px", borderRadius: 10, background: S.card2 }}>
+        ⚡ {theme.label}: {theme.blurb}
+      </div>
+      <button className="primary" onClick={onStart}
+        style={{ width: "100%", maxWidth: 360, padding: 16, fontSize: 17 }}>
+        Make my pick →
+      </button>
+      <button className="ghost" onClick={onBack}
+        style={{ marginTop: 10, fontSize: 13 }}>Back</button>
+    </div>
   );
 }
 function PlayerView({ id, phone, playerId, onBack }) {
   const [page, setPage] = useState("roster");
   const [showHistory, setShowHistory] = useState(false);
+  const [ackedPick, setAckedPick] = useState(-1); // last pickIdx the player tapped "YOU'RE UP" for
   const { g, notFound: missing, save, patch } = usePolledGroup(id);
 
   if (missing) return (
@@ -1794,6 +1874,10 @@ function PlayerView({ id, phone, playerId, onBack }) {
     // rules gate before first pick
     if (myTurn && !seenRules) {
       return <RulesGate g={g} onStart={markRulesSeen} onBack={onBack} />;
+    }
+    // "YOU'RE UP!" gate at the start of each of this player's turns
+    if (myTurn && seenRules && ackedPick !== g.pickIdx) {
+      return <YoureUp g={g} me={me} onStart={() => setAckedPick(g.pickIdx)} onBack={onBack} />;
     }
     return (
       <LiveDraft g={g} me={me} save={save} patch={patch} onBack={onBack}
