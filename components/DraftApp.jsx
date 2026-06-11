@@ -4,13 +4,15 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 /* ============================================================================
    WORLD CUP DRAFT — single-file app
    Persistence: window.storage (artifact KV). Swap STORAGE.* for a real
-   backend (fetch to your API) when you hst it; the rest of the app is agnostic.
+   backend (fetch to your API) when you host it; the rest of the app is agnostic.
    Notifications: NOTIFY.draftTurn() is a stub that logs. Wire Twilio there
    (server-side) by replacing the body with a fetch to your /notify endpoint.
 ============================================================================ */
 
 // Organizer password. Change this to whatever you want to hand out.
 const ORGANIZER_PASSWORD = "worldcup2026";
+// Admin password for the score-entry login on the main screen.
+const ADMIN_PASSWORD = "scores2026";
 
 /* ---------- Tournament data (2026 World Cup, all 48 teams) ---------- */
 const GROUPS = {
@@ -79,9 +81,8 @@ const THEMES = {
 };
 const DEFAULT_THEME = "goats";
 
-/* ---------- Storage layer: in-browser (artifact play version) ----------
-   Uses Supabase-backed API routes. get/set hit /api/groups, patch does an
-   atomic server-side merge, del removes a group. */
+/* ---------- Storage layer: Supabase-backed API routes ----------
+   get/set hit /api/groups, patch does an atomic server-side merge, del removes. */
 const INDEX_KEY = "wc:groups:index";
 const groupKey = (id) => `wc:group:${id}`;
 const idFromKey = (key) => key.startsWith("wc:group:") ? key.slice("wc:group:".length) : null;
@@ -108,7 +109,7 @@ const STORAGE = {
   },
   async set(key, value) {
     try {
-      if (key === INDEX_KEY) return true; // derived server-side
+      if (key === INDEX_KEY) return true;
       const id = idFromKey(key);
       if (id) {
         const r = await fetch(`/api/groups/${id}`, {
@@ -130,7 +131,6 @@ const STORAGE = {
       return r.ok;
     } catch (e) { console.error("STORAGE.del failed", e); return false; }
   },
-  // Atomic single-field change via the server PATCH endpoint.
   async patch(id, payload) {
     try {
       const r = await fetch(`/api/groups/${id}`, {
@@ -263,6 +263,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [inviteId, setInviteId] = useState(null);
   const [orgUnlocked, setOrgUnlocked] = useState(false); // organizer password gate
+  const [adminUnlocked, setAdminUnlocked] = useState(false); // score-admin gate
 
   const loadIndex = useCallback(async () => {
     const idx = (await STORAGE.get(INDEX_KEY)) || [];
@@ -285,11 +286,25 @@ export default function App() {
       {route.name === "landing" && (
         <Landing
           onOrganizer={() => setRoute({ name: orgUnlocked ? "home" : "orgPassword" })}
-          onPlayer={() => setRoute({ name: "login" })} />
+          onPlayer={() => setRoute({ name: "login" })}
+          onAdmin={() => setRoute({ name: adminUnlocked ? "adminGroups" : "adminPassword" })} />
       )}
       {route.name === "orgPassword" && (
         <OrganizerPassword onBack={() => setRoute({ name: "landing" })}
           onUnlock={() => { setOrgUnlocked(true); setRoute({ name: "home" }); }} />
+      )}
+      {route.name === "adminPassword" && (
+        <OrganizerPassword admin onBack={() => setRoute({ name: "landing" })}
+          onUnlock={() => { setAdminUnlocked(true); setRoute({ name: "adminGroups" }); }} />
+      )}
+      {route.name === "adminGroups" && (
+        <AdminGroupPicker index={index}
+          onBack={() => setRoute({ name: "landing" })}
+          onOpen={(id) => setRoute({ name: "adminScores", id })} />
+      )}
+      {route.name === "adminScores" && (
+        <AdminScores id={route.id}
+          onBack={() => setRoute({ name: "adminGroups" })} />
       )}
       {route.name === "login" && (
         <PlayerLogin onBack={() => setRoute({ name: "landing" })}
@@ -333,7 +348,7 @@ export default function App() {
 }
 
 /* ---------- Landing: choose organizer or player ---------- */
-function Landing({ onOrganizer, onPlayer }) {
+function Landing({ onOrganizer, onPlayer, onAdmin }) {
   return (
     <>
       <header style={{ paddingTop: 48, paddingBottom: 28 }}>
@@ -362,23 +377,33 @@ function Landing({ onOrganizer, onPlayer }) {
           </div>
         </div>
       </button>
+      <button onClick={onAdmin} className="big-choice">
+        <span style={{ fontSize: 28 }}>⚽</span>
+        <div style={{ textAlign: "left" }}>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>Enter scores</div>
+          <div style={{ opacity: 0.6, fontSize: 13.5, marginTop: 2 }}>
+            Admin only — record match results as they happen
+          </div>
+        </div>
+      </button>
     </>
   );
 }
 
-/* ---------- Organizer password gate ---------- */
-function OrganizerPassword({ onBack, onUnlock }) {
+/* ---------- Organizer / Admin password gate ---------- */
+function OrganizerPassword({ onBack, onUnlock, admin }) {
   const [pw, setPw] = useState("");
   const [err, setErr] = useState("");
 
   function submit() {
-    if (pw === ORGANIZER_PASSWORD) onUnlock();
+    if (pw === (admin ? ADMIN_PASSWORD : ORGANIZER_PASSWORD)) onUnlock();
     else { setErr("That's not the right password."); }
   }
   return (
     <>
-      <Header title="Organizer access" onBack={onBack}
-        sub="Enter the password to create and manage groups." />
+      <Header title={admin ? "Score admin" : "Organizer access"} onBack={onBack}
+        sub={admin ? "Enter the admin password to record match results."
+          : "Enter the password to create and manage groups."} />
       <label style={lbl}>Password</label>
       <input className="inp" type="password" placeholder="••••••••"
         value={pw} onChange={(e) => { setPw(e.target.value); setErr(""); }}
@@ -386,6 +411,49 @@ function OrganizerPassword({ onBack, onUnlock }) {
       {err && <p style={{ color: "#ff8095", fontSize: 13, marginTop: 8 }}>{err}</p>}
       <button className="primary" onClick={submit}
         style={{ width: "100%", marginTop: 16 }}>Continue</button>
+    </>
+  );
+}
+
+/* ---------- Admin: pick a group to enter scores for ---------- */
+function AdminGroupPicker({ index, onBack, onOpen }) {
+  return (
+    <>
+      <Header title="Enter scores" onBack={onBack}
+        sub="Pick a draft group to record results for." />
+      {(!index || index.length === 0) ? (
+        <div style={{ ...card, textAlign: "center", padding: "32px 20px" }}>
+          <p style={{ opacity: 0.7, margin: 0 }}>No groups yet.</p>
+        </div>
+      ) : index.map((g) => (
+        <button key={g.id} onClick={() => onOpen(g.id)} className="row-card">
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 17 }}>{g.name}</div>
+            <div style={{ opacity: 0.5, fontSize: 13, marginTop: 2 }}>
+              {g.players} players · tap to enter scores
+            </div>
+          </div>
+          <span style={{ opacity: 0.4 }}>→</span>
+        </button>
+      ))}
+    </>
+  );
+}
+
+/* ---------- Admin: score entry for one group (reuses MatchupsTab) ---------- */
+function AdminScores({ id, onBack }) {
+  const { g, notFound, save, patch } = usePolledGroup(id);
+  if (notFound) return (
+    <div style={{ ...card, textAlign: "center", marginTop: 32 }}>
+      <p style={{ opacity: 0.7 }}>Couldn't load this group.</p>
+      <button className="primary" onClick={onBack} style={{ marginTop: 10 }}>Back</button>
+    </div>
+  );
+  if (!g) return <Spinner />;
+  return (
+    <>
+      <Header title={g.name} onBack={onBack} sub="Score entry — tap winners" />
+      <MatchupsTab g={g} save={save} patch={patch} />
     </>
   );
 }
@@ -655,6 +723,7 @@ function NewGroup({ onCancel, onCreated }) {
       rivals: {}, // playerId -> rival playerId
       draftTime: {}, // playerId -> total seconds spent drafting
       seenRules: {}, // playerId -> true once they've passed the start gate
+      draftReady: {}, // playerId -> timestamp once they tap START DRAFTING
       createdAt: Date.now(), shareLink: "",
     };
     await STORAGE.set(groupKey(id), group);
@@ -1037,6 +1106,64 @@ function AdminLobby({ g, save, patch }) {
 }
 
 /* ---------- Draft board (shared by admin in-person and player remote) ---------- */
+/* Live draft top bar: last pick · who's drafting now (+timer) · who's next. */
+function DraftTopBar({ g, curPlayer, curPlayerIdx, elapsed, canPick }) {
+  const pname = (pid) => g.players.find((p) => p.id === pid)?.name || "—";
+  const lastPick = g.picks.length > 0 ? g.picks[g.picks.length - 1] : null;
+  const nextIdx = g.order[g.pickIdx + 1];
+  const nextPlayer = nextIdx != null ? g.players[nextIdx] : null;
+  const cell = { flex: 1, textAlign: "center", padding: "2px 4px", minWidth: 0 };
+  const capLabel = { fontSize: 9.5, opacity: 0.5, textTransform: "uppercase",
+    letterSpacing: "0.08em", marginBottom: 4 };
+  return (
+    <div style={{ ...card, padding: "12px 8px", display: "flex", alignItems: "stretch",
+      borderColor: canPick ? S.accent : "#222d47" }}>
+      {/* Last pick */}
+      <div style={cell}>
+        <div style={capLabel}>Last pick</div>
+        {lastPick ? (
+          <>
+            <div style={{ fontSize: 20 }}>{FLAG[lastPick.team]}</div>
+            <div style={{ fontSize: 11.5, fontWeight: 700, marginTop: 2, overflow: "hidden",
+              textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{lastPick.team}</div>
+            <div style={{ fontSize: 10, opacity: 0.55, marginTop: 1 }}>{pname(lastPick.playerId)}</div>
+          </>
+        ) : <div style={{ fontSize: 12, opacity: 0.4, marginTop: 8 }}>—</div>}
+      </div>
+
+      <div style={{ width: 1, background: "#222d47", margin: "2px 4px" }} />
+
+      {/* On the clock */}
+      <div style={{ ...cell, flex: 1.2 }}>
+        <div style={{ ...capLabel, color: canPick ? S.accent : undefined,
+          opacity: canPick ? 0.9 : 0.5 }}>
+          {canPick ? "You're up" : "Drafting"}
+        </div>
+        <div style={{ fontWeight: 800, fontSize: 15, overflow: "hidden",
+          textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{curPlayer?.name || "—"}</div>
+        <div style={{ fontWeight: 800, fontSize: 20, marginTop: 2, fontVariantNumeric: "tabular-nums",
+          color: elapsed >= 60 ? "#ff8095" : S.accent }}>{fmtClock(elapsed)}</div>
+      </div>
+
+      <div style={{ width: 1, background: "#222d47", margin: "2px 4px" }} />
+
+      {/* Up next */}
+      <div style={cell}>
+        <div style={capLabel}>Up next</div>
+        {nextPlayer ? (
+          <>
+            <div style={{ width: 30, height: 30, borderRadius: 9, margin: "0 auto",
+              background: S.card2, display: "grid", placeItems: "center", fontWeight: 800,
+              fontSize: 13 }}>{nextPlayer.name[0].toUpperCase()}</div>
+            <div style={{ fontSize: 11.5, fontWeight: 700, marginTop: 4, overflow: "hidden",
+              textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{nextPlayer.name}</div>
+          </>
+        ) : <div style={{ fontSize: 11, opacity: 0.4, marginTop: 8 }}>last pick</div>}
+      </div>
+    </div>
+  );
+}
+
 function DraftBoard({ g, save, patch, canPick, spectating }) {
   const [stageFilter, setStageFilter] = useState("all");
   const taken = useMemo(() => new Set(g.picks.map((p) => p.team)), [g.picks]);
@@ -1150,27 +1277,8 @@ function DraftBoard({ g, save, patch, canPick, spectating }) {
         </div>
       )}
       {!done ? (
-        <div style={{ ...card, borderColor: canPick ? S.accent : "#222d47", display: "flex",
-          alignItems: "center", gap: 14 }}>
-          <div style={{ width: 44, height: 44, borderRadius: 12,
-            background: canPick ? S.accent : S.card2,
-            display: "grid", placeItems: "center", fontWeight: 800,
-            color: canPick ? "#0b1020" : S.ink,
-            fontSize: 18 }}>{(curPlayer?.name || "?")[0].toUpperCase()}</div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 12, opacity: 0.55, textTransform: "uppercase",
-              letterSpacing: "0.1em" }}>{canPick ? "On the clock" : "Drafting now"}</div>
-            <div style={{ fontWeight: 800, fontSize: 19 }}>
-              {curPlayer?.name}{canPick ? "" : " — waiting"}
-            </div>
-          </div>
-          <div style={{ textAlign: "right" }}>
-            <div style={{ fontWeight: 800, fontSize: 22, fontVariantNumeric: "tabular-nums",
-              color: elapsed >= 60 ? "#ff8095" : S.ink }}>{fmtClock(elapsed)}</div>
-            <div style={{ fontSize: 10, opacity: 0.45, textTransform: "uppercase",
-              letterSpacing: "0.08em" }}>this pick</div>
-          </div>
-        </div>
+        <DraftTopBar g={g} curPlayer={curPlayer} curPlayerIdx={curPlayerIdx}
+          elapsed={elapsed} canPick={canPick} />
       ) : (
         <div style={{ ...card, textAlign: "center" }}>
           <div style={{ fontSize: 30 }}>✅</div>
@@ -1264,36 +1372,90 @@ function LiveDraft({ g, me, save, patch, onBack, myTurn, pname }) {
 /* Group-stage round robin is generated; knockout fixtures are logged manually
    since the bracket depends on results. We surface all 72 group games. */
 
-// Each group's three matchday dates (2026). MD1/MD2/MD3.
-const GROUP_DATES = {
-  A: ["2026-06-11", "2026-06-18", "2026-06-24"],
-  B: ["2026-06-12", "2026-06-18", "2026-06-24"],
-  C: ["2026-06-13", "2026-06-19", "2026-06-24"],
-  D: ["2026-06-12", "2026-06-19", "2026-06-25"],
-  E: ["2026-06-14", "2026-06-20", "2026-06-25"],
-  F: ["2026-06-14", "2026-06-20", "2026-06-25"],
-  G: ["2026-06-15", "2026-06-21", "2026-06-26"],
-  H: ["2026-06-15", "2026-06-21", "2026-06-26"],
-  I: ["2026-06-16", "2026-06-22", "2026-06-26"],
-  J: ["2026-06-16", "2026-06-22", "2026-06-27"],
-  K: ["2026-06-17", "2026-06-23", "2026-06-27"],
-  L: ["2026-06-17", "2026-06-23", "2026-06-27"],
-};
-// In a 4-team round robin, which matchday each (i,j) pairing belongs to.
-const PAIR_MATCHDAY = { "0-1": 0, "2-3": 0, "0-2": 1, "1-3": 1, "0-3": 2, "1-2": 2 };
+const GROUP_FIXTURES = [
+  {m:1,g:"A",h:"Mexico",a:"South Africa",d:"2026-06-11",day:"Thu",t:"3:00 PM"},
+  {m:2,g:"A",h:"South Korea",a:"Czechia",d:"2026-06-11",day:"Thu",t:"10:00 PM"},
+  {m:3,g:"B",h:"Canada",a:"Bosnia and Herzegovina",d:"2026-06-12",day:"Fri",t:"3:00 PM"},
+  {m:4,g:"D",h:"United States",a:"Paraguay",d:"2026-06-12",day:"Fri",t:"9:00 PM"},
+  {m:8,g:"B",h:"Qatar",a:"Switzerland",d:"2026-06-13",day:"Sat",t:"3:00 PM"},
+  {m:7,g:"C",h:"Brazil",a:"Morocco",d:"2026-06-13",day:"Sat",t:"6:00 PM"},
+  {m:5,g:"C",h:"Haiti",a:"Scotland",d:"2026-06-13",day:"Sat",t:"9:00 PM"},
+  {m:6,g:"D",h:"Australia",a:"Türkiye",d:"2026-06-13",day:"Sat",t:"12:00 AM"},
+  {m:10,g:"E",h:"Germany",a:"Curaçao",d:"2026-06-14",day:"Sun",t:"1:00 PM"},
+  {m:11,g:"F",h:"Netherlands",a:"Japan",d:"2026-06-14",day:"Sun",t:"4:00 PM"},
+  {m:9,g:"E",h:"Ivory Coast",a:"Ecuador",d:"2026-06-14",day:"Sun",t:"7:00 PM"},
+  {m:12,g:"F",h:"Sweden",a:"Tunisia",d:"2026-06-14",day:"Sun",t:"10:00 PM"},
+  {m:14,g:"H",h:"Spain",a:"Cape Verde",d:"2026-06-15",day:"Mon",t:"12:00 PM"},
+  {m:16,g:"G",h:"Belgium",a:"Egypt",d:"2026-06-15",day:"Mon",t:"3:00 PM"},
+  {m:13,g:"H",h:"Saudi Arabia",a:"Uruguay",d:"2026-06-15",day:"Mon",t:"6:00 PM"},
+  {m:15,g:"G",h:"Iran",a:"New Zealand",d:"2026-06-15",day:"Mon",t:"9:00 PM"},
+  {m:17,g:"I",h:"France",a:"Senegal",d:"2026-06-16",day:"Tue",t:"3:00 PM"},
+  {m:18,g:"I",h:"Iraq",a:"Norway",d:"2026-06-16",day:"Tue",t:"6:00 PM"},
+  {m:19,g:"J",h:"Argentina",a:"Algeria",d:"2026-06-16",day:"Tue",t:"9:00 PM"},
+  {m:20,g:"J",h:"Austria",a:"Jordan",d:"2026-06-16",day:"Tue",t:"12:00 AM"},
+  {m:23,g:"K",h:"Portugal",a:"DR Congo",d:"2026-06-17",day:"Wed",t:"1:00 PM"},
+  {m:21,g:"L",h:"England",a:"Croatia",d:"2026-06-17",day:"Wed",t:"4:00 PM"},
+  {m:22,g:"L",h:"Ghana",a:"Panama",d:"2026-06-17",day:"Wed",t:"7:00 PM"},
+  {m:24,g:"K",h:"Uzbekistan",a:"Colombia",d:"2026-06-17",day:"Wed",t:"10:00 PM"},
+  {m:25,g:"A",h:"Czechia",a:"South Africa",d:"2026-06-18",day:"Thu",t:"12:00 PM"},
+  {m:26,g:"B",h:"Switzerland",a:"Bosnia and Herzegovina",d:"2026-06-18",day:"Thu",t:"3:00 PM"},
+  {m:27,g:"B",h:"Canada",a:"Qatar",d:"2026-06-18",day:"Thu",t:"6:00 PM"},
+  {m:28,g:"A",h:"Mexico",a:"South Korea",d:"2026-06-18",day:"Thu",t:"9:00 PM"},
+  {m:32,g:"D",h:"United States",a:"Australia",d:"2026-06-19",day:"Fri",t:"3:00 PM"},
+  {m:30,g:"C",h:"Scotland",a:"Morocco",d:"2026-06-19",day:"Fri",t:"6:00 PM"},
+  {m:29,g:"C",h:"Brazil",a:"Haiti",d:"2026-06-19",day:"Fri",t:"9:00 PM"},
+  {m:31,g:"D",h:"Türkiye",a:"Paraguay",d:"2026-06-19",day:"Fri",t:"12:00 AM"},
+  {m:35,g:"F",h:"Netherlands",a:"Sweden",d:"2026-06-20",day:"Sat",t:"1:00 PM"},
+  {m:33,g:"E",h:"Germany",a:"Ivory Coast",d:"2026-06-20",day:"Sat",t:"4:00 PM"},
+  {m:34,g:"E",h:"Ecuador",a:"Curaçao",d:"2026-06-20",day:"Sat",t:"8:00 PM"},
+  {m:36,g:"F",h:"Tunisia",a:"Japan",d:"2026-06-20",day:"Sat",t:"12:00 AM"},
+  {m:38,g:"H",h:"Spain",a:"Saudi Arabia",d:"2026-06-21",day:"Sun",t:"12:00 PM"},
+  {m:39,g:"G",h:"Belgium",a:"Iran",d:"2026-06-21",day:"Sun",t:"3:00 PM"},
+  {m:37,g:"H",h:"Uruguay",a:"Cape Verde",d:"2026-06-21",day:"Sun",t:"6:00 PM"},
+  {m:40,g:"G",h:"New Zealand",a:"Egypt",d:"2026-06-21",day:"Sun",t:"9:00 PM"},
+  {m:43,g:"J",h:"Argentina",a:"Austria",d:"2026-06-22",day:"Mon",t:"1:00 PM"},
+  {m:42,g:"I",h:"France",a:"Iraq",d:"2026-06-22",day:"Mon",t:"5:00 PM"},
+  {m:41,g:"I",h:"Norway",a:"Senegal",d:"2026-06-22",day:"Mon",t:"8:00 PM"},
+  {m:44,g:"J",h:"Jordan",a:"Algeria",d:"2026-06-22",day:"Mon",t:"11:00 PM"},
+  {m:47,g:"K",h:"Portugal",a:"Uzbekistan",d:"2026-06-23",day:"Tue",t:"1:00 PM"},
+  {m:45,g:"L",h:"England",a:"Ghana",d:"2026-06-23",day:"Tue",t:"4:00 PM"},
+  {m:46,g:"L",h:"Panama",a:"Croatia",d:"2026-06-23",day:"Tue",t:"7:00 PM"},
+  {m:48,g:"K",h:"Colombia",a:"DR Congo",d:"2026-06-23",day:"Tue",t:"10:00 PM"},
+  {m:51,g:"B",h:"Switzerland",a:"Canada",d:"2026-06-24",day:"Wed",t:"3:00 PM"},
+  {m:52,g:"B",h:"Bosnia and Herzegovina",a:"Qatar",d:"2026-06-24",day:"Wed",t:"3:00 PM"},
+  {m:49,g:"C",h:"Scotland",a:"Brazil",d:"2026-06-24",day:"Wed",t:"6:00 PM"},
+  {m:50,g:"C",h:"Morocco",a:"Haiti",d:"2026-06-24",day:"Wed",t:"6:00 PM"},
+  {m:53,g:"A",h:"Czechia",a:"Mexico",d:"2026-06-24",day:"Wed",t:"9:00 PM"},
+  {m:54,g:"A",h:"South Africa",a:"South Korea",d:"2026-06-24",day:"Wed",t:"9:00 PM"},
+  {m:55,g:"E",h:"Curaçao",a:"Ivory Coast",d:"2026-06-25",day:"Thu",t:"4:00 PM"},
+  {m:56,g:"E",h:"Ecuador",a:"Germany",d:"2026-06-25",day:"Thu",t:"4:00 PM"},
+  {m:57,g:"F",h:"Japan",a:"Sweden",d:"2026-06-25",day:"Thu",t:"7:00 PM"},
+  {m:58,g:"F",h:"Tunisia",a:"Netherlands",d:"2026-06-25",day:"Thu",t:"7:00 PM"},
+  {m:59,g:"D",h:"Türkiye",a:"United States",d:"2026-06-25",day:"Thu",t:"10:00 PM"},
+  {m:60,g:"D",h:"Paraguay",a:"Australia",d:"2026-06-25",day:"Thu",t:"10:00 PM"},
+  {m:61,g:"I",h:"Norway",a:"France",d:"2026-06-26",day:"Fri",t:"3:00 PM"},
+  {m:62,g:"I",h:"Senegal",a:"Iraq",d:"2026-06-26",day:"Fri",t:"3:00 PM"},
+  {m:65,g:"H",h:"Cape Verde",a:"Saudi Arabia",d:"2026-06-26",day:"Fri",t:"8:00 PM"},
+  {m:66,g:"H",h:"Uruguay",a:"Spain",d:"2026-06-26",day:"Fri",t:"8:00 PM"},
+  {m:63,g:"G",h:"Egypt",a:"Iran",d:"2026-06-26",day:"Fri",t:"11:00 PM"},
+  {m:64,g:"G",h:"New Zealand",a:"Belgium",d:"2026-06-26",day:"Fri",t:"11:00 PM"},
+  {m:67,g:"L",h:"Panama",a:"England",d:"2026-06-27",day:"Sat",t:"5:00 PM"},
+  {m:68,g:"L",h:"Croatia",a:"Ghana",d:"2026-06-27",day:"Sat",t:"5:00 PM"},
+  {m:71,g:"K",h:"Colombia",a:"Portugal",d:"2026-06-27",day:"Sat",t:"7:30 PM"},
+  {m:72,g:"K",h:"DR Congo",a:"Uzbekistan",d:"2026-06-27",day:"Sat",t:"7:30 PM"},
+  {m:69,g:"J",h:"Algeria",a:"Austria",d:"2026-06-27",day:"Sat",t:"10:00 PM"},
+  {m:70,g:"J",h:"Jordan",a:"Argentina",d:"2026-06-27",day:"Sat",t:"10:00 PM"},
+];
 
+// Real 2026 group-stage fixtures (FIFA official schedule). Each match has a
+// stable match number (m), group (g), home (h), away (a), and date (d).
+// id uses the match number so results stay keyed correctly.
 function groupStageFixtures() {
-  const games = [];
-  for (const [gr, teams] of Object.entries(GROUPS)) {
-    for (let i = 0; i < teams.length; i++)
-      for (let j = i + 1; j < teams.length; j++) {
-        const md = PAIR_MATCHDAY[`${i}-${j}`];
-        games.push({ id: `group-${gr}-${i}-${j}`, stage: "group",
-          home: teams[i], away: teams[j], group: gr,
-          date: GROUP_DATES[gr][md] });
-      }
-  }
-  return games;
+  return GROUP_FIXTURES.map((f) => ({
+    id: `group-m${f.m}`, stage: "group",
+    home: f.h, away: f.a, group: f.g, date: f.d, matchNum: f.m,
+    day: f.day, time: f.t,
+  }));
 }
 function MatchupsTab({ g, save, patch }) {
   const ownerOf = useCallback(
@@ -1341,6 +1503,8 @@ function MatchupsTab({ g, save, patch }) {
             textTransform: "uppercase", letterSpacing: "0.08em" }}>
             {stageLabel(game.stage)}{game.group ? ` · Group ${game.group}` : ""}
           </span>
+          {(game.day && game.time) && <span style={{ fontSize: 11, opacity: 0.6,
+            fontWeight: 600 }}>{fmtWhen(game)}</span>}
           {sameOwner && <span style={{ fontSize: 10, opacity: 0.5 }}>same owner · no contest</span>}
           {removable && <button className="ghost" style={{ padding: "2px 8px", fontSize: 12 }}
             onClick={() => rmKo(game.id)}>✕</button>}
@@ -1360,6 +1524,16 @@ function MatchupsTab({ g, save, patch }) {
             </button>
           );
         })}
+        {game.stage === "group" && (
+          <button onClick={() => setWinner(game.id, "DRAW")}
+            style={{ width: "100%", marginTop: 6, padding: "8px 12px", borderRadius: 10,
+              cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+              background: winner === "DRAW" ? S.card2 : "transparent",
+              border: `1px dashed ${winner === "DRAW" ? S.winB : "#2a3556"}`,
+              color: winner === "DRAW" ? S.winB : "#9fb0d0" }}>
+            {winner === "DRAW" ? "✓ Draw" : "Draw"}
+          </button>
+        )}
       </div>
     );
   }
@@ -1415,14 +1589,32 @@ function MatchupsTab({ g, save, patch }) {
 /* ---------- Standings ---------- */
 /* Rival scoring constants */
 const RIVAL = {
-  beatYourRival: 6,   // your team beats a team your rival owns
-  beatYourHater: 2,   // your team beats a team owned by someone who picked you as rival
-  perRound: 2,        // ± per knockout round based on rival's survival
+  beatYourRival: 2,   // +2: your team beats a team your rival owns (each time)
+  beatYourHater: 1,   // +1: your team beats a team owned by someone who picked you
   ownBothFinalists: 10,
   speedFastest: 1,
   speedSlowest: -1,
   latePenalty: -1,    // last player to accept the invite
 };
+// Legends: performance-based labels. value = points applied. Ties award no label.
+const LEGENDS = [
+  { key: "loser",   label: "Biggest Loser",      value: 1,  emoji: "💀",
+    desc: "Most match losses (teams you own losing)." },
+  { key: "late",    label: "Unfashionably Late", value: -1, emoji: "🐌",
+    desc: "Last to accept the invite." },
+  { key: "shortbus",label: "Short Bus",          value: -1, emoji: "🚌",
+    desc: "Slowest total draft time." },
+  { key: "adhd",    label: "ADHD",               value: 0,  emoji: "⚡",
+    desc: "Fastest total draft time." },
+  { key: "france",  label: "Freedom Fries",      value: -1, emoji: "🍟",
+    desc: "Has France on the roster." },
+  { key: "maga",    label: "Secret MAGA",        value: 0,  emoji: "🦅",
+    desc: "Has the USA on the roster." },
+  { key: "cstudent",label: "C-Student",          value: 2,  emoji: "📝",
+    desc: "Most draws (ties) among teams owned." },
+  { key: "villain", label: "Villain",            value: 0,  emoji: "😈",
+    desc: "Picked as a rival by the most players." },
+];
 const KO_STAGES = ["r32", "r16", "qf", "sf", "final"]; // ascending depth
 
 // Is the draft board open for picking?
@@ -1431,6 +1623,18 @@ function draftIsOpen(g) {
   if (g.started) return true;
   if (g.scheduledStart && Date.now() >= g.scheduledStart) return true;
   return false;
+}
+// Everyone has tapped START DRAFTING (remote). For in-person, the single device
+// drives readiness, so it's ready as soon as inPersonReady is set.
+function allReady(g) {
+  if (g.mode === "inperson") return !!g.inPersonReady;
+  const ready = g.draftReady || {};
+  // Only players who are in the draft need to be ready. Everyone listed must be ready.
+  return g.players.length > 0 && g.players.every((p) => ready[p.id]);
+}
+function readyCount(g) {
+  const ready = g.draftReady || {};
+  return g.players.filter((p) => ready[p.id]).length;
 }
 // The player who accepted last (by timestamp) — gets the late penalty.
 function lastAccepter(g) {
@@ -1455,99 +1659,161 @@ function computeStandings(g) {
   g.players.forEach((p) => { haters[p.id] = []; });
   Object.entries(rivals).forEach(([pid, rid]) => { if (haters[rid]) haters[rid].push(pid); });
 
-  const raw = {}, wins = {}, themeB = {}, rivalB = {}, elimB = {}, finalB = {}, speedB = {};
+  const raw = {}, wins = {}, losses = {}, draws = {}, themeB = {}, rivalB = {}, finalB = {}, speedB = {};
   g.players.forEach((p) => {
-    raw[p.id] = wins[p.id] = themeB[p.id] = rivalB[p.id] = elimB[p.id] = finalB[p.id] = speedB[p.id] = 0;
+    raw[p.id] = wins[p.id] = losses[p.id] = draws[p.id] = 0;
+    themeB[p.id] = rivalB[p.id] = finalB[p.id] = speedB[p.id] = 0;
   });
   const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
 
   const ko = g.koGames || [];
   const allGames = [...groupStageFixtures(), ...ko];
   for (const game of allGames) {
-    const w = g.results[game.id];
-    if (!w) continue;
-    const own = ownerOf(w);
-    if (!own) continue;
-    raw[own] += stagePts(game.stage);
-    wins[own] += 1;
+    const res = g.results[game.id];
+    if (!res) continue;
+    const hOwn = ownerOf(game.home), aOwn = ownerOf(game.away);
+    if (res === "DRAW") {
+      // a tie: both owners get a draw tally (for C-Student), no win points
+      if (hOwn) draws[hOwn] += 1;
+      if (aOwn) draws[aOwn] += 1;
+      continue;
+    }
+    const w = res;
     const loser = game.home === w ? game.away : game.home;
-    themeB[own] += theme.bonus(loser, w);
-    // rival bonuses: did the winner's owner beat their rival / a hater?
-    const loserOwner = ownerOf(loser);
-    if (loserOwner) {
-      if (rivals[own] === loserOwner) rivalB[own] += RIVAL.beatYourRival;
-      if ((haters[own] || []).includes(loserOwner)) rivalB[own] += RIVAL.beatYourHater;
+    const own = ownerOf(w), loserOwner = ownerOf(loser);
+    if (own) {
+      raw[own] += stagePts(game.stage);
+      wins[own] += 1;
+      themeB[own] += theme.bonus(loser, w);
+      if (loserOwner) {
+        // NEW rival scoring: +2 each time you beat a team your rival owns,
+        // +1 each time you beat a team owned by someone who picked you.
+        if (rivals[own] === loserOwner) rivalB[own] += RIVAL.beatYourRival;
+        if ((haters[own] || []).includes(loserOwner)) rivalB[own] += RIVAL.beatYourHater;
+      }
     }
+    if (loserOwner) losses[loserOwner] += 1;
   }
 
-  // Which teams reached each knockout round (appeared in a game of that stage)
-  const reachedTeams = {}; // stage -> Set(team)
-  KO_STAGES.forEach((s) => { reachedTeams[s] = new Set(); });
+  // Which teams reached each knockout round (for own-both-finalists)
+  const reachedFinal = new Set();
   for (const game of ko) {
-    if (reachedTeams[game.stage]) {
-      reachedTeams[game.stage].add(game.home);
-      reachedTeams[game.stage].add(game.away);
-    }
+    if (game.stage === "final") { reachedFinal.add(game.home); reachedFinal.add(game.away); }
   }
-  // Rival elimination ladder: for each KO round that has begun (has any game),
-  // +perRound if rival has no team in it, -perRound if rival has a team in it.
-  for (const [pid, rid] of Object.entries(rivals)) {
-    if (!rid) continue;
-    const rTeams = new Set(teamsOf(rid));
-    for (const s of KO_STAGES) {
-      if (reachedTeams[s].size === 0) continue; // round not started, skip
-      const alive = [...rTeams].some((t) => reachedTeams[s].has(t));
-      elimB[pid] += alive ? -RIVAL.perRound : RIVAL.perRound;
-    }
-  }
-
-  // Own both finalists
-  if (reachedTeams.final.size >= 2) {
-    const finalists = [...reachedTeams.final];
-    const owners = finalists.map(ownerOf);
+  if (reachedFinal.size >= 2) {
+    const owners = [...reachedFinal].map(ownerOf);
     if (owners[0] && owners[0] === owners[1]) finalB[owners[0]] += RIVAL.ownBothFinalists;
   }
 
-  // Draft speed: fastest total time +1, slowest -1 (needs all players timed & draft done)
+  // Draft speed: fastest total time +1, slowest -1
   const dt = g.draftTime || {};
   const drafted = g.picks.length === ALL_TEAMS.length;
   const timed = g.players.filter((p) => dt[p.id] != null);
-  if (drafted && timed.length === g.players.length && g.players.length >= 2) {
+  let fastestId = null, slowestId = null;
+  if (timed.length === g.players.length && g.players.length >= 2) {
     let fast = timed[0], slow = timed[0];
     for (const p of timed) {
       if (dt[p.id] < dt[fast.id]) fast = p;
       if (dt[p.id] > dt[slow.id]) slow = p;
     }
-    if (fast.id !== slow.id) {
-      speedB[fast.id] += RIVAL.speedFastest;
-      speedB[slow.id] += RIVAL.speedSlowest;
-    }
+    if (fast.id !== slow.id) { fastestId = fast.id; slowestId = slow.id; }
+  }
+  if (drafted && fastestId && slowestId) {
+    speedB[fastestId] += RIVAL.speedFastest;
+    speedB[slowestId] += RIVAL.speedSlowest;
   }
 
-  // Unfashionably late: last player to accept the invite gets -1 (remote only).
+  // Unfashionably late: last player to accept the invite (remote only).
   const lateB = {};
   g.players.forEach((p) => { lateB[p.id] = 0; });
+  let lateId = null;
   if (g.mode !== "inperson" && draftIsOpen(g)) {
     const lid = lastAccepter(g);
-    // only penalize if more than one person accepted (a sole accepter isn't "late")
-    if (lid && Object.keys(g.accepted || {}).length >= 2) lateB[lid] += RIVAL.latePenalty;
+    if (lid && Object.keys(g.accepted || {}).length >= 2) lateId = lid;
   }
+
+  // ---- Legends: award labels (ties award nothing) ----
+  const legends = computeLegends(g, {
+    losses, draws, dt, teamsOf, rivals, fastestId, slowestId, lateId, timed, drafted,
+  });
+  // Apply legend point effects per player
+  const legendB = {};
+  g.players.forEach((p) => { legendB[p.id] = 0; });
+  Object.entries(legends).forEach(([pid, labels]) => {
+    labels.forEach((l) => { legendB[pid] += l.value; });
+  });
+  // lateB still drives the standings late chip; mirror from legend if present
+  if (lateId) lateB[lateId] += RIVAL.latePenalty;
 
   return g.players.map((p) => {
     const size = rosterSize[p.id] || 1;
     const mult = ALL_TEAMS.length / size;
     const scaled = raw[p.id] * mult;
-    const bonus = themeB[p.id] + rivalB[p.id] + elimB[p.id] + finalB[p.id]
-      + speedB[p.id] + lateB[p.id];
+    const bonus = themeB[p.id] + rivalB[p.id] + finalB[p.id]
+      + speedB[p.id] + legendB[p.id];
     return {
-      id: p.id, name: p.name, roster: size, wins: wins[p.id],
+      id: p.id, name: p.name, roster: size,
+      wins: wins[p.id], losses: losses[p.id], draws: draws[p.id],
       raw: raw[p.id], bonus,
-      themeB: themeB[p.id], rivalB: rivalB[p.id], elimB: elimB[p.id],
-      finalB: finalB[p.id], speedB: speedB[p.id], lateB: lateB[p.id],
+      themeB: themeB[p.id], rivalB: rivalB[p.id],
+      finalB: finalB[p.id], speedB: speedB[p.id], legendB: legendB[p.id],
+      legends: legends[p.id] || [],
       total: Math.round((scaled + bonus) * 10) / 10,
       mult: Math.round(mult * 100) / 100,
     };
   }).sort((a, b) => b.total - a.total);
+}
+
+// Decide who (if anyone) earns each legend label. Ties = no award.
+function computeLegends(g, ctx) {
+  const { losses, draws, dt, teamsOf, rivals, fastestId, slowestId, lateId, timed, drafted } = ctx;
+  const out = {};
+  g.players.forEach((p) => { out[p.id] = []; });
+  const byKey = Object.fromEntries(LEGENDS.map((l) => [l.key, l]));
+
+  // helper: unique argmax over a numeric map for the given player ids; null on tie/zero
+  const uniqueMax = (vals, { requirePositive = true } = {}) => {
+    let best = -Infinity, who = null, tie = false;
+    for (const p of g.players) {
+      const v = vals[p.id] || 0;
+      if (v > best) { best = v; who = p.id; tie = false; }
+      else if (v === best) tie = true;
+    }
+    if (tie) return null;
+    if (requirePositive && best <= 0) return null;
+    return who;
+  };
+
+  // Biggest Loser — most losses
+  const loserId = uniqueMax(losses);
+  if (loserId) out[loserId].push(byKey.loser);
+
+  // C-Student — most draws
+  const csId = uniqueMax(draws);
+  if (csId) out[csId].push(byKey.cstudent);
+
+  // Villain — picked as rival by the most players
+  const rivalCounts = {};
+  g.players.forEach((p) => { rivalCounts[p.id] = 0; });
+  Object.values(rivals).forEach((rid) => { if (rid && rivalCounts[rid] != null) rivalCounts[rid] += 1; });
+  const villainId = uniqueMax(rivalCounts);
+  if (villainId) out[villainId].push(byKey.villain);
+
+  // Short Bus / ADHD — slowest / fastest draft (only when everyone timed)
+  if (slowestId) out[slowestId].push(byKey.shortbus);
+  if (fastestId) out[fastestId].push(byKey.adhd);
+
+  // Unfashionably Late
+  if (lateId) out[lateId].push(byKey.late);
+
+  // Freedom Fries — has France; Secret MAGA — has USA (roster facts, can co-occur)
+  g.players.forEach((p) => {
+    const teams = teamsOf(p.id);
+    if (teams.includes("France")) out[p.id].push(byKey.france);
+    if (teams.includes("United States")) out[p.id].push(byKey.maga);
+  });
+
+  return out;
 }
 function StandingsTab({ g, highlightId }) {
   const rows = useMemo(() => computeStandings(g), [g]);
@@ -1571,11 +1837,10 @@ function StandingsTab({ g, highlightId }) {
       {rows.map((r, i) => {
         const chips = [];
         if (r.themeB) chips.push(["twist", r.themeB]);
-        if (r.rivalB) chips.push(["rival", r.rivalB]);
-        if (r.elimB) chips.push(["rival KO", r.elimB]);
+        if (r.rivalB) chips.push(["rivals", r.rivalB]);
         if (r.finalB) chips.push(["both finalists", r.finalB]);
         if (r.speedB) chips.push([r.speedB > 0 ? "fastest draft" : "slowest draft", r.speedB]);
-        if (r.lateB) chips.push(["late to accept", r.lateB]);
+        if (r.legendB) chips.push(["legends", r.legendB]);
         const barPct = leader > 0 ? Math.max(0, (r.total / leader) * 100) : 0;
         return (
         <div key={r.id} style={{ ...card, marginBottom: 8, display: "flex",
@@ -1625,6 +1890,15 @@ function fmtDate(iso) {
   if (!iso) return "TBD";
   const d = new Date(iso + "T12:00:00");
   return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
+// Prefer the fixture's own day + ET time when available, else format the date.
+function fmtWhen(gm) {
+  if (gm && gm.day && gm.time) {
+    const d = new Date(gm.date + "T12:00:00");
+    const md = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return `${gm.day} ${md} · ${gm.time} ET`;
+  }
+  return fmtDate(gm && gm.date);
 }
 function fmtDateTime(ts) {
   if (!ts) return "";
@@ -1719,8 +1993,8 @@ function fmtCountdown(ms) {
   return `${m}:${String(sec).padStart(2, "0")}`;
 }
 
-/* Phase 3a: one-time rules gate before a player's first pick */
-function RulesGate({ g, onStart, onBack }) {
+/* Step 1: DRAFT STARTING SOON — shows the rules, tap OK to continue. */
+function DraftStartingSoon({ g, onOk, onBack }) {
   const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
   const row = (label, val) => (
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline",
@@ -1732,7 +2006,14 @@ function RulesGate({ g, onStart, onBack }) {
   );
   return (
     <>
-      <Header title={g.name} onBack={onBack} sub="How scoring works" />
+      <Header title={g.name} onBack={onBack} />
+      <div style={{ textAlign: "center", margin: "8px 0 18px" }}>
+        <div style={{ font: "800 clamp(30px, 9vw, 44px)/1 'Space Grotesk', sans-serif",
+          letterSpacing: "-0.02em", color: S.accent }}>DRAFT STARTING SOON</div>
+        <p style={{ opacity: 0.6, fontSize: 14, marginTop: 8 }}>
+          Here's how scoring works. Read up, then tap OK.
+        </p>
+      </div>
 
       {/* Prominent active-twist callout */}
       <div style={{ borderRadius: 16, padding: "16px 18px", marginBottom: 14,
@@ -1773,18 +2054,16 @@ function RulesGate({ g, onStart, onBack }) {
         <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 13.5, lineHeight: 1.7,
           opacity: 0.82 }}>
           <li>Fewer teams on your roster = more points per win (it's balanced).</li>
-          <li>After the draft you pick a <strong>rival</strong> — beat them for bonus points.</li>
+          <li>Next you'll pick a <strong>rival</strong> — beat their teams for bonus points.</li>
           <li>The <strong>fastest</strong> overall drafter earns +{RIVAL.speedFastest}, the
             slowest loses {Math.abs(RIVAL.speedSlowest)}. Don't dawdle on your picks.</li>
+          <li>Watch out for <strong>Legends</strong> — performance labels that add or subtract points.</li>
         </ul>
       </div>
 
-      <button className="primary" onClick={onStart} style={{ width: "100%" }}>
-        Got it — start my pick →
+      <button className="primary" onClick={onOk} style={{ width: "100%" }}>
+        OK — pick my rival →
       </button>
-      <p style={{ fontSize: 12, opacity: 0.45, textAlign: "center", marginTop: 8 }}>
-        Your pick clock starts when you tap.
-      </p>
     </>
   );
 }
@@ -1821,8 +2100,144 @@ function YoureUp({ g, me, onStart, onBack }) {
     </div>
   );
 }
+
+/* Step 2: pick your rival, before the draft. */
+function RivalPickScreen({ g, me, onSet, pname, onBack }) {
+  const [pending, setPending] = useState("");
+  const others = g.players.filter((p) => p.id !== me?.id);
+  return (
+    <>
+      <Header title={g.name} onBack={onBack} sub="Pick your rival" />
+      <div style={{ ...card, marginBottom: 14 }}>
+        <h2 style={{ font: "800 22px 'Space Grotesk', sans-serif", margin: "0 0 8px" }}>
+          Choose your rival 🎯
+        </h2>
+        <p style={{ fontSize: 13.5, lineHeight: 1.55, opacity: 0.82, margin: 0 }}>
+          Your rival is the person you most want to beat. Every time one of your teams
+          beats one of theirs, you score <strong style={{ color: S.accent }}>+{RIVAL.beatYourRival}</strong>.
+          And any time you beat a team owned by someone who picked <em>you</em> as their
+          rival, you get <strong style={{ color: S.accent }}>+{RIVAL.beatYourHater}</strong>.
+          Pick is permanent, so choose your nemesis wisely.
+        </p>
+      </div>
+      <div style={{ ...lbl }}>Your rival</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+        {others.map((p) => {
+          const on = pending === p.id;
+          return (
+            <button key={p.id} onClick={() => setPending(p.id)}
+              style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 16px",
+                borderRadius: 14, cursor: "pointer", fontFamily: "inherit", textAlign: "left",
+                background: on ? S.accent : S.card2,
+                color: on ? "#0b1020" : S.ink,
+                border: `1.5px solid ${on ? S.accent : "transparent"}`,
+                fontWeight: on ? 800 : 600, fontSize: 16 }}>
+              <span style={{ width: 26, height: 26, borderRadius: 8, flexShrink: 0,
+                display: "grid", placeItems: "center", fontWeight: 800,
+                background: on ? "#0b1020" : S.bg, color: on ? S.accent : S.ink,
+                fontSize: 13 }}>{p.name[0].toUpperCase()}</span>
+              {p.name}
+            </button>
+          );
+        })}
+      </div>
+      <button className="primary" disabled={!pending}
+        onClick={() => pending && onSet(pending)}
+        style={{ width: "100%", padding: 16, fontSize: 16, opacity: pending ? 1 : 0.4 }}>
+        KICK THAT LOSER'S BUTT! 👊
+      </button>
+    </>
+  );
+}
+
+/* Step 3: reveal who's rivals with who, then START DRAFTING (marks ready). */
+function RivalsReveal({ g, me, pname, onStart, onBack }) {
+  const rivals = g.rivals || {};
+  const withRival = g.players.filter((p) => rivals[p.id]);
+  return (
+    <>
+      <Header title={g.name} onBack={onBack} sub="The rivalries" />
+      <div style={{ textAlign: "center", margin: "4px 0 16px" }}>
+        <div style={{ font: "800 clamp(26px,8vw,38px)/1 'Space Grotesk', sans-serif",
+          letterSpacing: "-0.02em" }}>⚔️ Rivalries set</div>
+        <p style={{ opacity: 0.6, fontSize: 14, marginTop: 8 }}>
+          Here's who's gunning for who.
+        </p>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 18 }}>
+        {withRival.map((p) => {
+          const mine = p.id === me?.id;
+          return (
+            <div key={p.id} style={{ ...card, padding: "12px 14px",
+              borderColor: mine ? S.accent : "#222d47",
+              display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontWeight: mine ? 800 : 700, fontSize: 15 }}>
+                {p.name}{mine ? " (you)" : ""}
+              </span>
+              <span style={{ flex: 1, textAlign: "center", opacity: 0.5, fontSize: 18 }}>→</span>
+              <span style={{ fontWeight: 700, fontSize: 15, color: S.accent }}>
+                {pname(rivals[p.id])}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <button className="primary" onClick={onStart} style={{ width: "100%", padding: 16,
+        fontSize: 16 }}>
+        START DRAFTING
+      </button>
+      <p style={{ fontSize: 12, opacity: 0.5, textAlign: "center", marginTop: 8 }}>
+        The draft begins once everyone has tapped this.
+      </p>
+    </>
+  );
+}
+
+/* Step 4: loading lobby — wait for everyone to tap START DRAFTING. */
+function ReadyLobby({ g, me, pname, onBack }) {
+  const ready = g.draftReady || {};
+  const total = g.players.length;
+  const have = readyCount(g);
+  return (
+    <>
+      <Header title={g.name} onBack={onBack} sub="Waiting room" />
+      <div style={{ textAlign: "center", margin: "12px 0 20px" }}>
+        <div className="pulse" style={{ font: "800 clamp(30px,9vw,46px)/1 'Space Grotesk', sans-serif",
+          color: S.accent }}>GET READY…</div>
+        <p style={{ opacity: 0.7, fontSize: 15, marginTop: 10 }}>
+          Waiting for everyone to tap START DRAFTING.
+        </p>
+        <div style={{ font: "800 26px 'Space Grotesk', sans-serif", marginTop: 10 }}>
+          {have} / {total} ready
+        </div>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {g.players.map((p) => {
+          const isReady = !!ready[p.id];
+          return (
+            <div key={p.id} style={{ ...card, padding: "12px 14px", display: "flex",
+              alignItems: "center", gap: 10,
+              borderColor: isReady ? S.winB : "#222d47", opacity: isReady ? 1 : 0.6 }}>
+              <span style={{ fontSize: 18 }}>{isReady ? "✅" : "⏳"}</span>
+              <span style={{ flex: 1, fontWeight: 700, fontSize: 15 }}>
+                {p.name}{p.id === me?.id ? " (you)" : ""}
+              </span>
+              <span style={{ fontSize: 12, opacity: 0.6 }}>
+                {isReady ? "ready" : "waiting…"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <p style={{ fontSize: 12.5, opacity: 0.5, textAlign: "center", marginTop: 16,
+        lineHeight: 1.5 }}>
+        The draft clock won't start until everyone's in. Hang tight.
+      </p>
+    </>
+  );
+}
 function PlayerView({ id, phone, playerId, onBack }) {
-  const [page, setPage] = useState("roster");
+  const [page, setPage] = useState("standings");
   const [showHistory, setShowHistory] = useState(false);
   const [ackedPick, setAckedPick] = useState(-1); // last pickIdx the player tapped "YOU'RE UP" for
   const { g, notFound: missing, save, patch } = usePolledGroup(id);
@@ -1859,24 +2274,44 @@ function PlayerView({ id, phone, playerId, onBack }) {
   async function markRulesSeen() {
     await patch({ op: "seenRules", playerId: me.id });
   }
+  async function markReady() {
+    await patch({ op: "draftReady", playerId: me.id });
+  }
+
+  const myRival = (g.rivals || {})[me?.id];
+  const iAmReady = !!(g.draftReady || {})[me?.id];
+  const everyoneReady = allReady(g);
 
   // PHASE 1: remote, not yet accepted -> accept screen
   if (g.mode !== "inperson" && !accepted && !drafted) {
     return <AcceptInvite g={g} me={me} onBack={onBack} onAccept={accept} />;
   }
-  // PHASE 2: accepted but draft not open yet -> waiting lobby
+  // PHASE 2: accepted but draft window not open yet -> waiting lobby
   if (!open && !drafted) {
     return <WaitingLobby g={g} me={me} onBack={onBack} pname={pname} />;
   }
-  // PHASE 3: draft is open and not finished -> live draft on your phone
-  if (open && !drafted) {
-    const myTurn = g.order[g.pickIdx] === g.players.findIndex((p) => p.id === me?.id);
-    // rules gate before first pick
-    if (myTurn && !seenRules) {
-      return <RulesGate g={g} onStart={markRulesSeen} onBack={onBack} />;
+
+  // ---- PRE-DRAFT SEQUENCE (remote only; once draft window open, before picking) ----
+  if (open && !drafted && g.mode !== "inperson") {
+    // Step 1: DRAFT STARTING SOON — rules. Tap OK to continue.
+    if (!seenRules) {
+      return <DraftStartingSoon g={g} onOk={markRulesSeen} onBack={onBack} />;
     }
-    // "YOU'RE UP!" gate at the start of each of this player's turns
-    if (myTurn && seenRules && ackedPick !== g.pickIdx) {
+    // Step 2: pick your rival (before the draft).
+    if (!myRival) {
+      return <RivalPickScreen g={g} me={me} onSet={setRival} pname={pname} onBack={onBack} />;
+    }
+    // Step 3: rivals reveal + START DRAFTING (marks you ready).
+    if (!iAmReady) {
+      return <RivalsReveal g={g} me={me} pname={pname} onStart={markReady} onBack={onBack} />;
+    }
+    // Step 4: waiting for everyone to hit START DRAFTING.
+    if (!everyoneReady) {
+      return <ReadyLobby g={g} me={me} pname={pname} onBack={onBack} />;
+    }
+    // Step 5: live draft — timer only runs now that everyone is ready.
+    const myTurn = g.order[g.pickIdx] === g.players.findIndex((p) => p.id === me?.id);
+    if (myTurn && ackedPick !== g.pickIdx) {
       return <YoureUp g={g} me={me} onStart={() => setAckedPick(g.pickIdx)} onBack={onBack} />;
     }
     return (
@@ -1884,31 +2319,153 @@ function PlayerView({ id, phone, playerId, onBack }) {
         myTurn={myTurn} pname={pname} />
     );
   }
+  // In-person: the draft runs on the shared phone. A player opening their own
+  // phone mid-draft just waits for it to finish.
+  if (open && !drafted && g.mode === "inperson") {
+    return (
+      <>
+        <Header title={g.name} onBack={onBack} sub={`Playing as ${me?.name}`} />
+        <div style={{ ...card, textAlign: "center", padding: "40px 24px" }}>
+          <div className="pulse" style={{ fontSize: 30 }}>🎲</div>
+          <p style={{ fontWeight: 700, marginTop: 10 }}>Draft in progress</p>
+          <p style={{ opacity: 0.6, fontSize: 13.5, lineHeight: 1.5, marginTop: 4 }}>
+            This draft is happening on the shared phone. Check back here once it's done
+            to see your roster and the standings.
+          </p>
+        </div>
+      </>
+    );
+  }
 
-  // PHASE 4: draft done -> dashboard
+  // PHASE 4: draft done -> dashboard. Standings is home.
   return (
     <>
       <Header title={g.name} onBack={onBack} sub={`Playing as ${me?.name}`}
         right={<button className="ghost" onClick={() => setShowHistory(true)}
           style={{ marginTop: 4, fontSize: 13 }}>Draft log</button>} />
-      <RivalPicker g={g} me={me} onSet={setRival} pname={pname} />
-      <nav style={{ display: "flex", gap: 5, marginBottom: 18 }}>
-        {[["roster", "Roster"], ["upcoming", "Upcoming"],
-          ["rivals", "Competition"], ["standings", "Standings"]]
-          .map(([k, l]) => (
-            <button key={k} onClick={() => setPage(k)}
-              className={page === k ? "tab on" : "tab"}
-              style={{ fontSize: 12.5, padding: "10px 3px" }}>{l}</button>
-          ))}
-      </nav>
-      {page === "roster" && <PlayerRoster g={g} myTeams={myTeams} />}
-      {page === "upcoming" && (
-        <PlayerUpcoming g={g} myTeamSet={myTeamSet} ownerOf={ownerOf} pname={pname} meId={me?.id} />
+
+      {page === "standings" && (
+        <StandingsHome g={g} meId={me?.id} ownerOf={ownerOf} pname={pname}
+          onOpen={(pg) => setPage(pg)} />
       )}
-      {page === "rivals" && <PlayerRivals g={g} meId={me?.id} />}
-      {page === "standings" && <StandingsTab g={g} highlightId={me?.id} />}
+      {page === "roster" && (
+        <DashSection title="Roster" onBack={() => setPage("standings")}>
+          <PlayerRoster g={g} myTeams={myTeams} />
+        </DashSection>
+      )}
+      {page === "upcoming" && (
+        <DashSection title="Upcoming" onBack={() => setPage("standings")}>
+          <PlayerUpcoming g={g} myTeamSet={myTeamSet} ownerOf={ownerOf} pname={pname} meId={me?.id} />
+        </DashSection>
+      )}
+      {page === "legends" && (
+        <DashSection title="Legends" onBack={() => setPage("standings")}>
+          <LegendsPage g={g} meId={me?.id} pname={pname} />
+        </DashSection>
+      )}
+      {page === "competition" && (
+        <DashSection title="Competition" onBack={() => setPage("standings")}>
+          <PlayerRivals g={g} meId={me?.id} />
+        </DashSection>
+      )}
+      {page === "rivalries" && (
+        <DashSection title="Rivalries" onBack={() => setPage("standings")}>
+          <RivalriesPage g={g} meId={me?.id} ownerOf={ownerOf} pname={pname} />
+        </DashSection>
+      )}
       {showHistory && <DraftHistory g={g} onClose={() => setShowHistory(false)} />}
     </>
+  );
+}
+
+/* Simple section wrapper with a back-to-standings control. */
+function DashSection({ title, onBack, children }) {
+  return (
+    <>
+      <button className="ghost" onClick={onBack}
+        style={{ marginBottom: 12, fontSize: 13 }}>← Standings</button>
+      <div style={{ ...lbl, marginBottom: 10 }}>{title}</div>
+      {children}
+    </>
+  );
+}
+
+/* Standings home: leaderboard + next game + 2x2 nav + rivalries button. */
+function StandingsHome({ g, meId, ownerOf, pname, onOpen }) {
+  const next = useMemo(() => nextUpcomingGame(g), [g]);
+  const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
+  // show the special rule only if the next game involves a country it applies to
+  const themeApplies = next && theme.targets &&
+    (theme.targets.includes(next.home) || theme.targets.includes(next.away));
+  const nav = [
+    ["roster", "Roster", "📋"], ["upcoming", "Upcoming", "📅"],
+    ["legends", "Legends", "🏷️"], ["competition", "Competition", "🌍"],
+  ];
+  return (
+    <>
+      {/* Next game spotlight */}
+      {next && (
+        <div style={{ ...card, marginBottom: 14, borderColor: S.accent, padding: "14px 16px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+            <span style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase",
+              letterSpacing: "0.1em", color: S.accent }}>Next up</span>
+            <span style={{ fontSize: 12, opacity: 0.7, fontWeight: 600 }}>{fmtWhen(next)}</span>
+          </div>
+          <NextSide team={next.home} ownerOf={ownerOf} pname={pname} meId={meId} />
+          <div style={{ textAlign: "center", fontSize: 11, opacity: 0.35, margin: "3px 0" }}>vs</div>
+          <NextSide team={next.away} ownerOf={ownerOf} pname={pname} meId={meId} />
+          {themeApplies && (
+            <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10,
+              background: "rgba(36,152,218,0.16)", fontSize: 12.5, lineHeight: 1.4 }}>
+              ⚡ <strong>{theme.label}</strong> in effect this match — {theme.blurb} (+{theme.amount})
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Leaderboard */}
+      <StandingsTab g={g} highlightId={meId} />
+
+      {/* 2x2 nav */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 18 }}>
+        {nav.map(([key, label, icon]) => (
+          <button key={key} onClick={() => onOpen(key)}
+            style={{ ...card, padding: "18px 14px", cursor: "pointer", textAlign: "left",
+              fontFamily: "inherit", color: "inherit", display: "flex", flexDirection: "column",
+              gap: 6, border: "1px solid #222d47" }}>
+            <span style={{ fontSize: 24 }}>{icon}</span>
+            <span style={{ fontWeight: 800, fontSize: 16 }}>{label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Rivalries button */}
+      <button onClick={() => onOpen("rivalries")}
+        style={{ ...card, width: "100%", marginTop: 10, padding: "16px",
+          cursor: "pointer", fontFamily: "inherit", color: "inherit",
+          display: "flex", alignItems: "center", gap: 12, border: `1px solid ${S.accent}` }}>
+        <span style={{ fontSize: 24 }}>⚔️</span>
+        <div style={{ textAlign: "left", flex: 1 }}>
+          <div style={{ fontWeight: 800, fontSize: 16 }}>Rivalries</div>
+          <div style={{ opacity: 0.6, fontSize: 12.5 }}>How you're doing against your rival</div>
+        </div>
+        <span style={{ opacity: 0.4 }}>→</span>
+      </button>
+    </>
+  );
+}
+
+function NextSide({ team, ownerOf, pname, meId }) {
+  const own = ownerOf(team);
+  const mine = own === meId;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "3px 0" }}>
+      <span style={{ fontSize: 20 }}>{FLAG[team]}</span>
+      <span style={{ flex: 1, fontWeight: mine ? 800 : 600, fontSize: 16,
+        opacity: mine ? 1 : 0.85 }}>{team}</span>
+      <span style={{ fontSize: 12, opacity: 0.6, fontWeight: mine ? 700 : 500,
+        color: mine ? S.accent : S.ink }}>{own ? pname(own) : "undrafted"}</span>
+    </div>
   );
 }
 
@@ -1948,8 +2505,9 @@ function RivalPicker({ g, me, onSet, pname }) {
           </button>
           <p style={{ fontSize: 12, opacity: 0.55, margin: "8px 0 0", lineHeight: 1.5 }}>
             This is permanent — you can't change your rival once locked.
-            +{RIVAL.beatYourRival} whenever your team beats theirs, +{RIVAL.perRound} each
-            knockout round they're out, −{RIVAL.perRound} each round they survive.
+            +{RIVAL.beatYourRival} every time one of your teams beats one of theirs.
+            And +{RIVAL.beatYourHater} every time you beat a team owned by someone who
+            picked you.
           </p>
         </>
       )}
@@ -2051,18 +2609,24 @@ function ScoringRules({ g, theme }) {
       </Section>
 
       <Section title="Rivals">
-        <Rule pts={RIVAL.beatYourRival}>Your team beats a team your rival drafted.</Rule>
-        <Rule pts={RIVAL.beatYourHater}>Your team beats a team owned by someone who picked you as their rival.</Rule>
-        <Rule pts={RIVAL.perRound}>Each knockout round your rival has no team left in.</Rule>
-        <Rule pts={-RIVAL.perRound}>Each knockout round your rival still has a team alive.</Rule>
+        <Rule pts={RIVAL.beatYourRival}>Every time your team beats a team your rival drafted.</Rule>
+        <Rule pts={RIVAL.beatYourHater}>Every time your team beats a team owned by someone who picked you as their rival.</Rule>
         <p style={{ fontSize: 12, opacity: 0.5, marginTop: 8, lineHeight: 1.5 }}>
-          Rivals are chosen after the draft and locked permanently. A player everyone
-          targets collects penalties from each of them, but is fought over all tournament.
+          Rivals are chosen before the draft and locked permanently.
         </p>
       </Section>
 
       <Section title="Final">
         <Rule pts={RIVAL.ownBothFinalists}>You drafted both teams in the final.</Rule>
+      </Section>
+
+      <Section title="Legends">
+        {LEGENDS.map((l) => (
+          <Rule key={l.key} pts={l.value}>{l.emoji} {l.label} — {l.desc}</Rule>
+        ))}
+        <p style={{ fontSize: 12, opacity: 0.5, marginTop: 8, lineHeight: 1.5 }}>
+          Legends are awarded by performance. If there's a tie for one, nobody gets it.
+        </p>
       </Section>
 
       <Section title="Draft speed">
@@ -2192,6 +2756,136 @@ function PlayerRivals({ g, meId }) {
   );
 }
 
+// The single soonest undecided game across the whole tournament (any teams).
+// GROUP_FIXTURES is already in chronological order, so we keep that order and
+// just drop decided games; knockout games (added later) come after.
+function nextUpcomingGame(g) {
+  const results = g.results || {};
+  const games = [...groupStageFixtures(), ...(g.koGames || [])]
+    .filter((gm) => !results[gm.id]);
+  return games[0] || null;
+}
+
+/* Legends page: who holds each label, and its point effect. */
+function LegendsPage({ g, meId, pname }) {
+  const rows = useMemo(() => computeStandings(g), [g]);
+  const holders = {};
+  LEGENDS.forEach((l) => { holders[l.key] = []; });
+  rows.forEach((r) => {
+    (r.legends || []).forEach((l) => { holders[l.key].push({ name: r.name, id: r.id }); });
+  });
+  return (
+    <>
+      <p style={{ fontSize: 13, opacity: 0.6, margin: "0 0 14px", lineHeight: 1.5 }}>
+        Labels are awarded by performance and change the score. If players tie for one,
+        nobody gets it.
+      </p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {LEGENDS.map((l) => {
+          const who = holders[l.key];
+          const mine = who.some((w) => w.id === meId);
+          const sign = l.value > 0 ? `+${l.value}` : `${l.value}`;
+          return (
+            <div key={l.key} style={{ ...card, padding: "12px 14px",
+              borderColor: mine ? S.accent : "#222d47" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 22 }}>{l.emoji}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 800, fontSize: 15 }}>{l.label}</div>
+                  <div style={{ fontSize: 12, opacity: 0.6, marginTop: 1 }}>{l.desc}</div>
+                </div>
+                <span style={{ fontWeight: 800, fontSize: 14,
+                  color: l.value > 0 ? S.winB : (l.value < 0 ? "#ff8095" : "#9fb0d0"),
+                  fontVariantNumeric: "tabular-nums" }}>
+                  {l.value === 0 ? "±0" : sign}
+                </span>
+              </div>
+              <div style={{ marginTop: 8, fontSize: 13 }}>
+                {who.length === 0
+                  ? <span style={{ opacity: 0.45 }}>Unclaimed{l.value !== 0 ? " (tie or nobody qualifies)" : ""}</span>
+                  : who.map((w, i) => (
+                      <span key={w.id} style={{ fontWeight: w.id === meId ? 800 : 600,
+                        color: w.id === meId ? S.accent : S.ink }}>
+                        {w.name}{i < who.length - 1 ? ", " : ""}
+                      </span>
+                    ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+/* Rivalries page: each player vs their rival, with head-to-head match record. */
+function RivalriesPage({ g, meId, ownerOf, pname }) {
+  const rivals = g.rivals || {};
+  const results = g.results || {};
+  const teamsOf = (pid) => g.picks.filter((x) => x.playerId === pid).map((x) => x.team);
+  const allGames = [...groupStageFixtures(), ...(g.koGames || [])];
+
+  function headToHead(pid, rid) {
+    let pWins = 0, rWins = 0;
+    for (const gm of allGames) {
+      const res = results[gm.id];
+      if (!res || res === "DRAW") continue;
+      const loser = gm.home === res ? gm.away : gm.home;
+      const wOwn = ownerOf(res), lOwn = ownerOf(loser);
+      if (wOwn === pid && lOwn === rid) pWins++;
+      if (wOwn === rid && lOwn === pid) rWins++;
+    }
+    return { pWins, rWins };
+  }
+
+  const withRival = g.players.filter((p) => rivals[p.id]);
+  if (withRival.length === 0) return (
+    <div style={{ ...card, textAlign: "center" }}>
+      <p style={{ opacity: 0.7, margin: 0 }}>No rivalries set.</p>
+    </div>
+  );
+  return (
+    <>
+      <p style={{ fontSize: 13, opacity: 0.6, margin: "0 0 14px", lineHeight: 1.5 }}>
+        Each player picked a rival before the draft. Beating your rival's teams scores
+        +{RIVAL.beatYourRival} each time. Here's how everyone's doing.
+      </p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {withRival.map((p) => {
+          const rid = rivals[p.id];
+          const { pWins, rWins } = headToHead(p.id, rid);
+          const mine = p.id === meId;
+          const winning = pWins > rWins, losing = pWins < rWins;
+          return (
+            <div key={p.id} style={{ ...card, padding: "12px 14px",
+              borderColor: mine ? S.accent : "#222d47" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontWeight: mine ? 800 : 700, fontSize: 15, flex: 1 }}>
+                  {p.name}{mine ? " (you)" : ""}
+                </span>
+                <span style={{ fontWeight: 800, fontSize: 18, fontVariantNumeric: "tabular-nums",
+                  color: winning ? S.winB : (losing ? "#ff8095" : S.ink) }}>
+                  {pWins}–{rWins}
+                </span>
+                <span style={{ opacity: 0.5, fontSize: 13 }}>vs</span>
+                <span style={{ fontWeight: 700, fontSize: 15, color: S.accent }}>
+                  {pname(rid)}
+                </span>
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.55, marginTop: 4 }}>
+                {pWins + rWins === 0 ? "No head-to-head results yet."
+                  : winning ? `${p.name} is winning this rivalry.`
+                  : losing ? `${pname(rid)} has the edge so far.`
+                  : "Dead even."}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
 function PlayerUpcoming({ g, myTeamSet, ownerOf, pname, meId }) {
   const results = g.results || {};
   // group-stage fixtures have dates; knockout games are dated by stage order if no date.
@@ -2232,7 +2926,7 @@ function PlayerUpcoming({ g, myTeamSet, ownerOf, pname, meId }) {
                 textTransform: "uppercase", letterSpacing: "0.06em" }}>
                 {stageLabel(gm.stage)}{gm.group ? ` · Group ${gm.group}` : ""}
               </span>
-              <span style={{ fontSize: 12, opacity: 0.7, fontWeight: 600 }}>{fmtDate(gm.date)}</span>
+              <span style={{ fontSize: 12, opacity: 0.7, fontWeight: 600 }}>{fmtWhen(gm)}</span>
             </div>
             <Side team={gm.home} mine={hMine} owner={ownerOf(gm.home)} pname={pname} />
             <div style={{ textAlign: "center", fontSize: 11, opacity: 0.35, margin: "2px 0" }}>vs</div>
@@ -2318,5 +3012,7 @@ const globalCSS = `
     border-radius: 10px; border: 1.5px solid transparent; color: #e8ecf5; cursor: pointer;
     font-family: inherit; margin-top: 6px; }
   details summary::-webkit-details-marker { display: none; }
-  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .pulse { animation: pulse 1.4s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } .pulse { animation: none; } }
 `;
