@@ -138,7 +138,11 @@ const STORAGE = {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      if (!r.ok) return null;
+      if (!r.ok) {
+        const detail = await r.text().catch(() => "");
+        console.error(`STORAGE.patch ${payload && payload.op} failed: ${r.status} ${detail}`);
+        return null;
+      }
       const j = await r.json();
       return j.group || null;
     } catch (e) { console.error("STORAGE.patch failed", e); return null; }
@@ -2289,17 +2293,31 @@ function PlayerView({ id, phone, playerId, onBack }) {
   async function setRival(rivalId) {
     if ((g.rivals || {})[me.id]) return; // already locked
     if (!rivalId) return;
-    await patch({ op: "setRival", playerId: me.id, rivalId });
+    const r = await patch({ op: "setRival", playerId: me.id, rivalId });
+    if (!r || !(r.rivals || {})[me.id]) {
+      await save({ ...g, rivals: { ...(g.rivals || {}), [me.id]: rivalId } });
+    }
   }
   async function accept() {
     if ((g.accepted || {})[me.id]) return;
-    await patch({ op: "accept", playerId: me.id });
+    const r = await patch({ op: "accept", playerId: me.id });
+    if (!r || !(r.accepted || {})[me.id]) {
+      await save({ ...g, accepted: { ...(g.accepted || {}), [me.id]: Date.now() } });
+    }
   }
   async function markRulesSeen() {
-    await patch({ op: "seenRules", playerId: me.id });
+    const r = await patch({ op: "seenRules", playerId: me.id });
+    if (!r || !(r.seenRules || {})[me.id]) {
+      await save({ ...g, seenRules: { ...(g.seenRules || {}), [me.id]: true } });
+    }
   }
   async function markReady() {
-    await patch({ op: "draftReady", playerId: me.id });
+    const r = await patch({ op: "draftReady", playerId: me.id });
+    // If the server echo doesn't reflect the change (e.g. an older route that
+    // ignores this op), force it through a whole-object save so the UI advances.
+    if (!r || !(r.draftReady || {})[me.id]) {
+      await save({ ...g, draftReady: { ...(g.draftReady || {}), [me.id]: Date.now() } });
+    }
   }
 
   const myRival = (g.rivals || {})[me?.id];
