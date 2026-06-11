@@ -143,6 +143,15 @@ const STORAGE = {
       return j.group || null;
     } catch (e) { console.error("STORAGE.patch failed", e); return null; }
   },
+  // Server-side phone lookup across all groups (robust login).
+  async findByPhone(phone) {
+    try {
+      const r = await fetch(`/api/groups?phone=${encodeURIComponent(phone)}`, { cache: "no-store" });
+      if (!r.ok) return [];
+      const j = await r.json();
+      return j.groups || [];
+    } catch (e) { console.error("STORAGE.findByPhone failed", e); return []; }
+  },
 };
 
 /* ---------- Notification stub (wire Twilio server-side here) ---------- */
@@ -485,11 +494,18 @@ function PlayerLogin({ onBack, onFound, inviteId }) {
         setBusy(false); onFound(np); return;
       }
     }
-    const idx = (await STORAGE.get(INDEX_KEY)) || [];
+    // Robust server-side lookup when available (deploy); else fall back to index loop.
     let found = false;
-    for (const entry of idx) {
-      const g = await STORAGE.get(groupKey(entry.id));
-      if (g && g.players.some((p) => normPhone(p.phone) === np)) { found = true; break; }
+    if (STORAGE.findByPhone) {
+      const groups = await STORAGE.findByPhone(np);
+      found = groups.length > 0;
+    }
+    if (!found) {
+      const idx = (await STORAGE.get(INDEX_KEY)) || [];
+      for (const entry of idx) {
+        const g = await STORAGE.get(groupKey(entry.id));
+        if (g && g.players.some((p) => normPhone(p.phone) === np)) { found = true; break; }
+      }
     }
     setBusy(false);
     if (found) onFound(np);
@@ -527,9 +543,17 @@ function PlayerGroups({ phone, onBack, onOpen }) {
   const [mine, setMine] = useState(null);
   useEffect(() => {
     (async () => {
-      const idx = (await STORAGE.get(INDEX_KEY)) || [];
+      // Prefer the robust server lookup; fall back to the index loop.
+      let entries = null;
+      if (STORAGE.findByPhone) {
+        const groups = await STORAGE.findByPhone(phone);
+        if (groups.length) entries = groups.map((x) => ({ id: x.id }));
+      }
+      if (!entries) {
+        entries = (await STORAGE.get(INDEX_KEY)) || [];
+      }
       const out = [];
-      for (const entry of idx) {
+      for (const entry of entries) {
         const g = await STORAGE.get(groupKey(entry.id));
         const me = g && g.players.find((p) => normPhone(p.phone) === phone);
         if (me) out.push({ id: g.id, name: g.name, me, players: g.players.length,
