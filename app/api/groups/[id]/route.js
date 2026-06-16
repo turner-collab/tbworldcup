@@ -56,6 +56,15 @@ export async function PATCH(request, { params }) {
     const { playerId } = body;
     g.seenRules = g.seenRules || {};
     g.seenRules[playerId] = true;
+  } else if (op === "draftReady") {
+    const { playerId } = body;
+    g.draftReady = g.draftReady || {};
+    if (!g.draftReady[playerId]) g.draftReady[playerId] = Date.now();
+  } else if (op === "lastLogin") {
+    // record the most recent time a player opened the app (for login-based awards)
+    const { playerId } = body;
+    g.lastLogin = g.lastLogin || {};
+    g.lastLogin[playerId] = Date.now();
   } else if (op === "pick") {
     // Append a draft pick, but only if it's still this player's turn and the
     // team isn't taken. Guards against double-taps and two phones racing.
@@ -79,6 +88,7 @@ export async function PATCH(request, { params }) {
   } else if (op === "inPersonReady") {
     g.inPersonReady = true;
   } else if (op === "setResult") {
+    // winner may be a goal object {h,a,w}, a team-name string, or null to clear.
     const { matchId, winner } = body;
     g.results = g.results || {};
     if (winner === null) delete g.results[matchId];
