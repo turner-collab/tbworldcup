@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase";
 
+// The shared tournament results live in a reserved row; never treat it as a group.
+const RESULTS_ID = "__results__";
+
 // GET /api/groups -> [{ id, name, players, phase }]  (lightweight index)
 // GET /api/groups?phone=NNN -> { groups: [{id,name}], matched: bool } for login
 export async function GET(request) {
@@ -8,18 +11,20 @@ export async function GET(request) {
   const { data, error } = await sb.from("groups").select("id, data");
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
+  const rows = (data || []).filter((row) => row.id !== RESULTS_ID);
+
   const url = new URL(request.url);
   const phone = url.searchParams.get("phone");
   if (phone) {
     const np = normPhone(phone);
-    const groups = (data || []).filter((row) => {
+    const groups = rows.filter((row) => {
       const players = (row.data || {}).players || [];
       return players.some((p) => normPhone(p.phone) === np);
     }).map((row) => ({ id: row.id, name: (row.data || {}).name }));
     return NextResponse.json({ groups, matched: groups.length > 0 });
   }
 
-  const index = (data || []).map((row) => {
+  const index = rows.map((row) => {
     const g = row.data || {};
     const drafted = (g.picks || []).length === 48;
     const open = draftIsOpen(g);
