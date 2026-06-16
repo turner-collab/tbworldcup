@@ -12,7 +12,7 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 // Organizer password. Change this to whatever you want to hand out.
 const ORGANIZER_PASSWORD = "worldcup2026";
 // Admin password for the score-entry login on the main screen.
-const ADMIN_PASSWORD = "scores2026";
+const ADMIN_PASSWORD = "sharkthedog";
 
 /* ---------- Tournament data (2026 World Cup, all 48 teams) ---------- */
 const GROUPS = {
@@ -152,18 +152,89 @@ const STORAGE = {
     } catch (e) { console.error("STORAGE.patch failed", e); return null; }
   },
   // Server-side phone lookup across all groups (robust login).
-  // Returns null (not []) when the endpoint is unavailable/wrong-shaped, so the
-  // caller can tell "no match" apart from "endpoint not deployed".
   async findByPhone(phone) {
     try {
       const r = await fetch(`/api/groups?phone=${encodeURIComponent(phone)}`, { cache: "no-store" });
       if (!r.ok) return null;
       const j = await r.json();
-      if (!j || !Array.isArray(j.groups)) return null; // old route returned {index}, not {groups}
+      if (!j || !Array.isArray(j.groups)) return null;
       return j.groups;
     } catch (e) { console.error("STORAGE.findByPhone failed", e); return null; }
   },
 };
+
+/* ---------- Shared tournament results ----------
+   Results are global to the whole tournament, NOT per group. One match has one
+   score, and every group reads the same one. Stored under a single key.
+   A result is { h: homeGoals, a: awayGoals, w: winningTeam }. For a group-stage
+   draw, w is "DRAW". For knockouts the admin always sets a winner (penalties if
+   level). Legacy data where a result is just a team-name string is still read
+   correctly via winnerOf(). */
+const _resultSubs = new Set();
+// Shared tournament results are stored in a single reserved row of the same
+// `groups` table (id "__results__"), so one admin score entry is visible to
+// every group. This needs no new table or API route — it reuses the existing
+// get/set-by-id endpoints. Real groups' own g.results are never touched.
+const RESULTS_ID = "__results__";
+const RESULTS_KEY = groupKey(RESULTS_ID);
+let _resultsCache = null;
+
+const RESULTS = {
+  async load() {
+    const data = (await STORAGE.get(RESULTS_KEY)) || {};
+    // the row may be wrapped as a "group" object; accept either shape
+    const map = data && data.results ? data.results : (data && !data.id ? data : {});
+    _resultsCache = map || {};
+    return _resultsCache;
+  },
+  get() { return _resultsCache || {}; },
+  async set(matchId, value) {
+    const cur = { ...(await this.load()) };
+    if (value == null) delete cur[matchId];
+    else cur[matchId] = value;
+    _resultsCache = cur;
+    // store under a wrapper object so the row is a valid "group"-shaped record
+    await STORAGE.set(RESULTS_KEY, { id: RESULTS_ID, results: cur });
+    _resultSubs.forEach((fn) => fn(cur));
+    return cur;
+  },
+  subscribe(fn) { _resultSubs.add(fn); return () => _resultSubs.delete(fn); },
+};
+
+// Derive the winning team from a result value (handles goals object,
+// legacy string, and "DRAW"). Returns null if no decisive winner.
+function winnerOf(res) {
+  if (!res) return null;
+  if (typeof res === "string") return res === "DRAW" ? null : res;
+  if (res.w) return res.w === "DRAW" ? null : res.w;
+  return null;
+}
+function isDraw(res) {
+  if (!res) return false;
+  if (typeof res === "string") return res === "DRAW";
+  return res.w === "DRAW";
+}
+// "2–1" style score string, or null if no goals recorded.
+function scoreText(res) {
+  if (!res || typeof res === "string") return null;
+  if (res.h == null || res.a == null) return null;
+  return `${res.h}–${res.a}`;
+}
+
+// Hook: live shared results, re-rendering when any score changes.
+function useSharedResults() {
+  const [results, setResults] = useState(() => RESULTS.get());
+  useEffect(() => {
+    let alive = true;
+    RESULTS.load().then((r) => { if (alive) setResults({ ...r }); });
+    const unsub = RESULTS.subscribe((r) => setResults({ ...r }));
+    // light polling so other devices' entries show up
+    const iv = setInterval(() => { RESULTS.load().then((r) => { if (alive) setResults({ ...r }); }); }, 5000);
+    return () => { alive = false; unsub(); clearInterval(iv); };
+  }, []);
+  return results;
+}
+
 
 /* ---------- Notification stub (wire Twilio server-side here) ---------- */
 const NOTIFY = {
@@ -234,14 +305,8 @@ function usePolledGroup(id, { intervalMs = 4000 } = {}) {
     // so we never overwrite fresher local state with a stale server copy.
     if (startStamp !== localStampRef.current || savingRef.current) return;
     if (data === null) {
-      // Tolerate transient misses (write-consistency lag, network blips).
-      // Only declare the group missing after several consecutive null reads,
-      // and never if we already have it loaded.
       missCountRef.current += 1;
-      setG((prev) => {
-        if (!prev && missCountRef.current >= 3) setNotFound(true);
-        return prev;
-      });
+      setG((prev) => { if (!prev && missCountRef.current >= 3) setNotFound(true); return prev; });
       return;
     }
     missCountRef.current = 0;
@@ -307,9 +372,10 @@ export default function App() {
   // If opened via an invite link (?g=GROUPID), send straight to player login.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const g = new URLSearchParams(window.location.search).get("g");
+    const params = new URLSearchParams(window.location.search);
+    const g = params.get("g");
     if (g) { setInviteId(g); setRoute({ name: "login", inviteId: g }); }
-  }, []);
+  }, [loadIndex]);
 
   if (loading) return <Shell><Spinner /></Shell>;
 
@@ -317,26 +383,31 @@ export default function App() {
     <Shell>
       {route.name === "landing" && (
         <Landing
-          onOrganizer={() => setRoute({ name: orgUnlocked ? "home" : "orgPassword" })}
           onPlayer={() => setRoute({ name: "login" })}
-          onAdmin={() => setRoute({ name: adminUnlocked ? "adminGroups" : "adminPassword" })} />
-      )}
-      {route.name === "orgPassword" && (
-        <OrganizerPassword onBack={() => setRoute({ name: "landing" })}
-          onUnlock={() => { setOrgUnlocked(true); setRoute({ name: "home" }); }} />
+          onAdmin={() => setRoute({ name: adminUnlocked ? "adminHome" : "adminPassword" })} />
       )}
       {route.name === "adminPassword" && (
         <OrganizerPassword admin onBack={() => setRoute({ name: "landing" })}
-          onUnlock={() => { setAdminUnlocked(true); setRoute({ name: "adminGroups" }); }} />
+          onUnlock={() => { setAdminUnlocked(true); setRoute({ name: "adminHome" }); }} />
+      )}
+      {route.name === "adminHome" && (
+        <AdminHome
+          onBack={() => setRoute({ name: "landing" })}
+          onGroups={() => setRoute({ name: "adminGroups" })}
+          onScores={() => setRoute({ name: "adminScores" })} />
       )}
       {route.name === "adminGroups" && (
-        <AdminGroupPicker index={index}
-          onBack={() => setRoute({ name: "landing" })}
-          onOpen={(id) => setRoute({ name: "adminScores", id })} />
+        <AdminManageGroups index={index}
+          onBack={() => setRoute({ name: "adminHome" })}
+          onOpen={(id) => setRoute({ name: "adminGroupDetail", id })}
+          onNew={() => setRoute({ name: "new" })} />
+      )}
+      {route.name === "adminGroupDetail" && (
+        <AdminGroupDetail id={route.id}
+          onBack={() => setRoute({ name: "adminGroups" })} />
       )}
       {route.name === "adminScores" && (
-        <AdminScores id={route.id}
-          onBack={() => setRoute({ name: "adminGroups" })} />
+        <AdminAllScores onBack={() => setRoute({ name: "adminHome" })} />
       )}
       {route.name === "login" && (
         <PlayerLogin onBack={() => setRoute({ name: "landing" })}
@@ -367,12 +438,12 @@ export default function App() {
           }} />
       )}
       {route.name === "new" && (
-        <NewGroup onCancel={() => setRoute({ name: "home" })}
-          onCreated={async (id) => { await loadIndex(); setRoute({ name: "group", id }); }} />
+        <NewGroup onCancel={() => setRoute({ name: "adminGroups" })}
+          onCreated={async (id) => { await loadIndex(); setRoute({ name: "adminGroupDetail", id }); }} />
       )}
       {route.name === "group" && (
         <GroupView id={route.id}
-          onBack={async () => { await loadIndex(); setRoute({ name: "home" }); }}
+          onBack={async () => { await loadIndex(); setRoute({ name: "adminGroups" }); }}
           onPlayAs={(playerId) => setRoute({ name: "playerView", id: route.id, playerId, fromGroup: true })} />
       )}
     </Shell>
@@ -380,12 +451,12 @@ export default function App() {
 }
 
 /* ---------- Landing: choose organizer or player ---------- */
-function Landing({ onOrganizer, onPlayer, onAdmin }) {
+function Landing({ onPlayer, onAdmin }) {
   return (
     <>
       <header style={{ paddingTop: 48, paddingBottom: 28 }}>
         <h1 style={{ font: "800 46px/0.95 'Space Grotesk', sans-serif",
-          letterSpacing: "-0.03em", margin: 0 }}>Jingoism</h1>
+          letterSpacing: "-0.03em", margin: 0 }}>Jingo</h1>
         <p style={{ fontSize: 16, fontWeight: 600, marginTop: 12, marginBottom: 0,
           opacity: 0.9 }}>Rabid Support For Every Nation</p>
         <div style={{ fontSize: 13, letterSpacing: "0.18em", textTransform: "uppercase",
@@ -400,21 +471,12 @@ function Landing({ onOrganizer, onPlayer, onAdmin }) {
           </div>
         </div>
       </button>
-      <button onClick={onOrganizer} className="big-choice">
-        <span style={{ fontSize: 28 }}>🗂️</span>
-        <div style={{ textAlign: "left" }}>
-          <div style={{ fontWeight: 800, fontSize: 18 }}>I'm the organizer</div>
-          <div style={{ opacity: 0.6, fontSize: 13.5, marginTop: 2 }}>
-            Create groups, run the draft, log results
-          </div>
-        </div>
-      </button>
       <button onClick={onAdmin} className="big-choice">
-        <span style={{ fontSize: 28 }}>⚽</span>
+        <span style={{ fontSize: 28 }}>🛠️</span>
         <div style={{ textAlign: "left" }}>
-          <div style={{ fontWeight: 800, fontSize: 18 }}>Enter scores</div>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>Admin</div>
           <div style={{ opacity: 0.6, fontSize: 13.5, marginTop: 2 }}>
-            Admin only — record match results as they happen
+            Manage groups and enter scores
           </div>
         </div>
       </button>
@@ -447,12 +509,39 @@ function OrganizerPassword({ onBack, onUnlock, admin }) {
   );
 }
 
-/* ---------- Admin: pick a group to enter scores for ---------- */
-function AdminGroupPicker({ index, onBack, onOpen }) {
+/* ---------- Admin home: two options ---------- */
+function AdminHome({ onBack, onGroups, onScores }) {
   return (
     <>
-      <Header title="Enter scores" onBack={onBack}
-        sub="Pick a draft group to record results for." />
+      <Header title="Admin" onBack={onBack} sub="Manage your leagues and results." />
+      <button onClick={onGroups} className="big-choice" style={{ borderColor: S.accent }}>
+        <span style={{ fontSize: 28 }}>🗂️</span>
+        <div style={{ textAlign: "left" }}>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>Manage Groups</div>
+          <div style={{ opacity: 0.6, fontSize: 13.5, marginTop: 2 }}>
+            See every group, its players, scores, and last login
+          </div>
+        </div>
+      </button>
+      <button onClick={onScores} className="big-choice">
+        <span style={{ fontSize: 28 }}>⚽</span>
+        <div style={{ textAlign: "left" }}>
+          <div style={{ fontWeight: 800, fontSize: 18 }}>Manage Scores</div>
+          <div style={{ opacity: 0.6, fontSize: 13.5, marginTop: 2 }}>
+            Enter goal scores for each match (equal score = draw)
+          </div>
+        </div>
+      </button>
+    </>
+  );
+}
+
+/* ---------- Admin: list of all active groups ---------- */
+function AdminManageGroups({ index, onBack, onOpen, onNew }) {
+  return (
+    <>
+      <Header title="Manage Groups" onBack={onBack}
+        sub="Every active group on the app. Tap one for details." />
       {(!index || index.length === 0) ? (
         <div style={{ ...card, textAlign: "center", padding: "32px 20px" }}>
           <p style={{ opacity: 0.7, margin: 0 }}>No groups yet.</p>
@@ -462,19 +551,24 @@ function AdminGroupPicker({ index, onBack, onOpen }) {
           <div>
             <div style={{ fontWeight: 700, fontSize: 17 }}>{g.name}</div>
             <div style={{ opacity: 0.5, fontSize: 13, marginTop: 2 }}>
-              {g.players} players · tap to enter scores
+              {g.players} player{g.players === 1 ? "" : "s"} · tap to view
             </div>
           </div>
           <span style={{ opacity: 0.4 }}>→</span>
         </button>
       ))}
+      {onNew && (
+        <button onClick={onNew} className="primary"
+          style={{ width: "100%", marginTop: 14 }}>+ New group</button>
+      )}
     </>
   );
 }
 
-/* ---------- Admin: score entry for one group (reuses MatchupsTab) ---------- */
-function AdminScores({ id, onBack }) {
-  const { g, notFound, save, patch } = usePolledGroup(id);
+/* ---------- Admin: one group's detail — players, scores, last login ---------- */
+function AdminGroupDetail({ id, onBack }) {
+  const { g, notFound } = usePolledGroup(id);
+  useSharedResults(); // recompute scores live as results change
   if (notFound) return (
     <div style={{ ...card, textAlign: "center", marginTop: 32 }}>
       <p style={{ opacity: 0.7 }}>Couldn't load this group.</p>
@@ -482,11 +576,214 @@ function AdminScores({ id, onBack }) {
     </div>
   );
   if (!g) return <Spinner />;
+
+  const rows = computeStandings(g); // sorted by total desc
+  const lastLogin = g.lastLogin || {};
+  const fmtLogin = (ts) => {
+    if (!ts) return "never logged in";
+    const d = new Date(ts);
+    const mins = Math.floor((Date.now() - ts) / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins} min ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs} hr${hrs === 1 ? "" : "s"} ago`;
+    return d.toLocaleString(undefined, { month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit" });
+  };
+
   return (
     <>
-      <Header title={g.name} onBack={onBack} sub="Score entry — tap winners" />
-      <MatchupsTab g={g} save={save} patch={patch} />
+      <Header title={g.name} onBack={onBack}
+        sub={`${rows.length} players · ${g.mode === "inperson" ? "in-person" : "remote"}`} />
+      {rows.map((r, i) => (
+        <div key={r.id} style={{ ...card, marginBottom: 8, padding: "12px 14px",
+          display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ fontSize: 18, fontWeight: 800, width: 24, textAlign: "center",
+            color: i === 0 ? S.accent : S.ink, opacity: i === 0 ? 1 : 0.4 }}>
+            {i + 1}
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 700, fontSize: 16 }}>{r.name}</div>
+            <div style={{ fontSize: 12, opacity: 0.5, marginTop: 2 }}>
+              {fmtLogin(lastLogin[r.id])}
+            </div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontWeight: 800, fontSize: 20, fontVariantNumeric: "tabular-nums",
+              color: r.total < 0 ? "#ff8095" : S.ink }}>{r.total}</div>
+            <div style={{ fontSize: 10.5, opacity: 0.45 }}>points</div>
+          </div>
+        </div>
+      ))}
     </>
+  );
+}
+
+/* ---------- Admin: ONE shared score screen for the whole tournament ----------
+   Lists every match once. Entering goals sets a shared result that every group
+   reads. Group-stage ties are draws; knockout ties prompt for a penalty winner. */
+function AdminAllScores({ onBack }) {
+  const results = useSharedResults();
+  const [koGames, setKoGames] = useState([]); // admin-added knockout games (shared sandbox-local)
+  const [stageFilter, setStageFilter] = useState("group");
+
+  const groupFix = useMemo(groupStageFixtures, []);
+  const allGames = stageFilter === "group"
+    ? groupFix
+    : koGames.filter((k) => k.stage === stageFilter);
+
+  // knockout adder
+  const [koHome, setKoHome] = useState("");
+  const [koAway, setKoAway] = useState("");
+  const koStage = stageFilter === "group" ? "r32" : stageFilter;
+
+  async function setGoals(game, h, a) {
+    const hg = h === "" ? null : Math.max(0, parseInt(h, 10) || 0);
+    const ag = a === "" ? null : Math.max(0, parseInt(a, 10) || 0);
+    if (hg == null || ag == null) {
+      // incomplete — clear the result
+      await RESULTS.set(game.id, null);
+      return;
+    }
+    let w;
+    if (hg > ag) w = game.home;
+    else if (ag > hg) w = game.away;
+    else w = game.stage === "group" ? "DRAW" : "PEN"; // knockout tie -> needs penalty winner
+    await RESULTS.set(game.id, { h: hg, a: ag, w });
+  }
+  async function setPenWinner(game, team) {
+    const res = results[game.id];
+    if (!res || typeof res === "string") return;
+    await RESULTS.set(game.id, { ...res, w: team, pen: true });
+  }
+  function addKo() {
+    if (!koHome || !koAway || koHome === koAway) return;
+    setKoGames((ks) => [...ks, { id: `ko-${uid()}`, stage: stageFilter, home: koHome, away: koAway }]);
+    setKoHome(""); setKoAway("");
+  }
+
+  const stages = [["group", "Groups"], ["r32", "R32"], ["r16", "R16"],
+    ["qf", "QF"], ["sf", "SF"], ["final", "Final"]];
+
+  return (
+    <>
+      <Header title="Enter scores" onBack={onBack}
+        sub="One scoreboard for everyone — a result here updates every group." />
+
+      <div style={{ display: "flex", gap: 5, marginBottom: 14, flexWrap: "wrap" }}>
+        {stages.map(([k, l]) => (
+          <button key={k} onClick={() => setStageFilter(k)}
+            className={stageFilter === k ? "tab on" : "tab"}
+            style={{ fontSize: 12.5, padding: "8px 10px", flex: "0 0 auto" }}>{l}</button>
+        ))}
+      </div>
+
+      {stageFilter !== "group" && (
+        <div style={{ ...card, marginBottom: 14, padding: "12px 14px" }}>
+          <div style={{ ...lbl, marginBottom: 8 }}>Add a {stageLabelG(stageFilter)} match</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <select className="inp" value={koHome} onChange={(e) => setKoHome(e.target.value)}
+              style={{ flex: 1, minWidth: 120 }}>
+              <option value="">Home…</option>
+              {ALL_TEAMS.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <select className="inp" value={koAway} onChange={(e) => setKoAway(e.target.value)}
+              style={{ flex: 1, minWidth: 120 }}>
+              <option value="">Away…</option>
+              {ALL_TEAMS.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <button className="primary" onClick={addKo} style={{ padding: "8px 14px" }}>Add</button>
+          </div>
+        </div>
+      )}
+
+      {allGames.length === 0 ? (
+        <div style={{ ...card, textAlign: "center", padding: "28px 16px" }}>
+          <p style={{ opacity: 0.6, margin: 0 }}>
+            {stageFilter === "group" ? "No fixtures." : `No ${stageLabelG(stageFilter)} matches added yet.`}
+          </p>
+        </div>
+      ) : allGames.map((game) => (
+        <AdminScoreRow key={game.id} game={game} res={results[game.id]}
+          onGoals={setGoals} onPenWinner={setPenWinner} />
+      ))}
+    </>
+  );
+}
+
+function stageLabelG(k) { return STAGES.find((s) => s.key === k)?.label || k; }
+
+/* A single match row on the shared admin screen: two goal inputs, derived
+   winner, and a penalty-winner picker for level knockout games. */
+function AdminScoreRow({ game, res, onGoals, onPenWinner }) {
+  const obj = res && typeof res === "object" ? res : null;
+  const [h, setH] = useState(obj && obj.h != null ? String(obj.h) : "");
+  const [a, setA] = useState(obj && obj.a != null ? String(obj.a) : "");
+  // keep local inputs in sync if another device changes the score
+  useEffect(() => {
+    const o = res && typeof res === "object" ? res : null;
+    setH(o && o.h != null ? String(o.h) : (typeof res === "string" ? "" : ""));
+    setA(o && o.a != null ? String(o.a) : "");
+  }, [res]);
+
+  const w = winnerOf(res);
+  const drawn = isDraw(res);
+  const needsPen = obj && obj.w === "PEN";
+  const goalInput = (val, set, onCommit) => (
+    <input className="inp" inputMode="numeric" value={val}
+      onChange={(e) => { const v = e.target.value.replace(/\D/g, "").slice(0, 2); set(v); }}
+      onBlur={onCommit} placeholder="–"
+      style={{ width: 52, textAlign: "center", fontWeight: 800, fontSize: 18, padding: "8px 4px" }} />
+  );
+
+  return (
+    <div style={{ ...card, padding: "10px 12px", marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+        <span style={{ fontSize: 11, opacity: 0.45, fontWeight: 700, textTransform: "uppercase",
+          letterSpacing: "0.08em" }}>
+          {stageLabelG(game.stage)}{game.group ? ` · Group ${game.group}` : ""}
+        </span>
+        {(game.day && game.time) && <span style={{ fontSize: 11, opacity: 0.6, fontWeight: 600 }}>
+          {fmtWhen(game)}</span>}
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 18 }}>{FLAG[game.home]}</span>
+          <span style={{ fontWeight: w === game.home ? 800 : 600, fontSize: 14 }}>{game.home}</span>
+        </div>
+        {goalInput(h, setH, () => onGoals(game, h, a))}
+        <span style={{ opacity: 0.4, fontWeight: 700 }}>–</span>
+        {goalInput(a, setA, () => onGoals(game, h, a))}
+        <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, justifyContent: "flex-end" }}>
+          <span style={{ fontWeight: w === game.away ? 800 : 600, fontSize: 14 }}>{game.away}</span>
+          <span style={{ fontSize: 18 }}>{FLAG[game.away]}</span>
+        </div>
+      </div>
+
+      {/* status line */}
+      <div style={{ marginTop: 8, fontSize: 12.5, textAlign: "center" }}>
+        {needsPen ? (
+          <div>
+            <div style={{ color: "#ffd166", fontWeight: 700, marginBottom: 6 }}>
+              Level after 90 — who won on penalties?
+            </div>
+            <div style={{ display: "flex", gap: 6, justifyContent: "center" }}>
+              {[game.home, game.away].map((t) => (
+                <button key={t} onClick={() => onPenWinner(game, t)}
+                  className="tab" style={{ padding: "6px 12px", fontSize: 12.5 }}>{t} (pens)</button>
+              ))}
+            </div>
+          </div>
+        ) : drawn ? (
+          <span style={{ color: "#9fb0d0", fontWeight: 700 }}>Draw</span>
+        ) : w ? (
+          <span style={{ color: S.winB, fontWeight: 700 }}>{w} win{obj && obj.pen ? " (pens)" : ""}</span>
+        ) : (
+          <span style={{ opacity: 0.4 }}>Enter goals to record this match</span>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -517,20 +814,11 @@ function PlayerLogin({ onBack, onFound, inviteId }) {
         setBusy(false); onFound(np); return;
       }
     }
-    // Robust server-side lookup when available (deploy); else fall back to index loop.
+    const idx = (await STORAGE.get(INDEX_KEY)) || [];
     let found = false;
-    const viaServer = STORAGE.findByPhone ? await STORAGE.findByPhone(np) : null;
-    if (Array.isArray(viaServer)) {
-      // Endpoint answered. Empty array = genuinely no match, but still try the
-      // index loop as a backstop in case of any server-side normalization gap.
-      found = viaServer.length > 0;
-    }
-    if (!found) {
-      const idx = (await STORAGE.get(INDEX_KEY)) || [];
-      for (const entry of idx) {
-        const g = await STORAGE.get(groupKey(entry.id));
-        if (g && g.players.some((p) => normPhone(p.phone) === np)) { found = true; break; }
-      }
+    for (const entry of idx) {
+      const g = await STORAGE.get(groupKey(entry.id));
+      if (g && g.players.some((p) => normPhone(p.phone) === np)) { found = true; break; }
     }
     setBusy(false);
     if (found) onFound(np);
@@ -568,17 +856,9 @@ function PlayerGroups({ phone, onBack, onOpen }) {
   const [mine, setMine] = useState(null);
   useEffect(() => {
     (async () => {
-      // Prefer the robust server lookup; fall back to the index loop.
-      let entries = null;
-      if (STORAGE.findByPhone) {
-        const groups = await STORAGE.findByPhone(phone);
-        if (Array.isArray(groups) && groups.length) entries = groups.map((x) => ({ id: x.id }));
-      }
-      if (!entries) {
-        entries = (await STORAGE.get(INDEX_KEY)) || [];
-      }
+      const idx = (await STORAGE.get(INDEX_KEY)) || [];
       const out = [];
-      for (const entry of entries) {
+      for (const entry of idx) {
         const g = await STORAGE.get(groupKey(entry.id));
         const me = g && g.players.find((p) => normPhone(p.phone) === phone);
         if (me) out.push({ id: g.id, name: g.name, me, players: g.players.length,
@@ -748,10 +1028,8 @@ function NewGroup({ onCancel, onCreated }) {
   const valid = name.trim() && players.filter((p) => p.name.trim()).length >= 2
     && !(mode === "remote" && when === "scheduled" && !startAt);
 
-  const [err, setErr] = useState("");
-
   async function create() {
-    setBusy(true); setErr("");
+    setBusy(true);
     const clean = players.filter((p) => p.name.trim())
       .map((p) => ({ ...p, name: p.name.trim(), phone: p.phone.trim() }));
     // Random draft order: shuffle player indices, then snake through them.
@@ -777,31 +1055,10 @@ function NewGroup({ onCancel, onCreated }) {
       draftReady: {}, // playerId -> timestamp once they tap START DRAFTING
       createdAt: Date.now(), shareLink: "",
     };
-    const ok = await STORAGE.set(groupKey(id), group);
-    if (!ok) {
-      setBusy(false);
-      setErr("Couldn't save the group to the server. Your changes weren't lost — "
-        + "check your connection and try again. If this keeps happening, the database "
-        + "connection may need attention.");
-      return;
-    }
-    // Verify the write is readable before navigating, so we never land on a
-    // group view that can't load. Retry the read briefly for write consistency.
-    let confirmed = null;
-    for (let i = 0; i < 4 && !confirmed; i++) {
-      confirmed = await STORAGE.get(groupKey(id));
-      if (!confirmed) await new Promise((r) => setTimeout(r, 350));
-    }
-    if (!confirmed) {
-      setBusy(false);
-      setErr("The group saved but didn't come back when we re-read it. Give it a moment "
-        + "and try opening it from the group list.");
-      return;
-    }
+    await STORAGE.set(groupKey(id), group);
     const idx = (await STORAGE.get(INDEX_KEY)) || [];
     idx.push({ id, name: group.name, players: clean.length, phase: "Setup" });
     await STORAGE.set(INDEX_KEY, idx);
-    setBusy(false);
     onCreated(id);
   }
 
@@ -930,10 +1187,6 @@ function NewGroup({ onCancel, onCreated }) {
         style={{ width: "100%", marginTop: 24, opacity: valid && !busy ? 1 : 0.4 }}>
         {busy ? "Creating…" : mode === "inperson" ? "Create & draft" : "Create & invite"}
       </button>
-      {err && (
-        <p style={{ color: "#ff8095", fontSize: 13, marginTop: 10, lineHeight: 1.5,
-          textAlign: "center" }}>{err}</p>
-      )}
       {!valid && (
         <p style={{ fontSize: 12, opacity: 0.5, textAlign: "center", marginTop: 8 }}>
           {mode === "remote" && when === "scheduled" && !startAt
@@ -1040,7 +1293,7 @@ function InviteLink({ g }) {
   async function share() {
     try {
       if (navigator.share) {
-        await navigator.share({ title: `${g.name} — Jingoism`,
+        await navigator.share({ title: `${g.name} — Jingo`,
           text: `Join my World Cup draft "${g.name}"`, url });
         return;
       }
@@ -1240,7 +1493,7 @@ function DraftTopBar({ g, curPlayer, curPlayerIdx, elapsed, canPick }) {
   );
 }
 
-function DraftBoard({ g, save, patch, canPick, spectating }) {
+function DraftBoard({ g, save, patch, canPick, spectating, ackedAt }) {
   const [stageFilter, setStageFilter] = useState("all");
   const taken = useMemo(() => new Set(g.picks.map((p) => p.team)), [g.picks]);
   const done = g.picks.length >= ALL_TEAMS.length;
@@ -1250,19 +1503,21 @@ function DraftBoard({ g, save, patch, canPick, spectating }) {
   const rosterCount = (pid) => g.picks.filter((p) => p.playerId === pid).length;
 
   // Per-turn live clock. Reset whenever the pick index changes.
+  // Remote: the clock starts when the player tapped "I'm up" (ackedAt). That tap
+  // is what advances them past the YOU'RE UP gate, so timing is fair — it only
+  // counts the time they actually spent choosing, not the wait for their turn.
+  // In-person: a tap-to-start gate on this screen sets the clock.
   const inPerson = g.mode === "inperson";
-  const [turnStart, setTurnStart] = useState(() => Date.now());
+  const [turnStart, setTurnStart] = useState(() => ackedAt || Date.now());
   const [now, setNow] = useState(() => Date.now());
   const [picking, setPicking] = useState(false);
-  // In-person: each turn waits for the player to tap "start" before the clock
-  // runs or the board is interactive. Resets every turn.
   const [turnStarted, setTurnStarted] = useState(!inPerson);
   useEffect(() => {
     setTurnStarted(!inPerson);
-    setTurnStart(Date.now());
+    setTurnStart(ackedAt || Date.now());
     setNow(Date.now());
     setPicking(false);
-  }, [g.pickIdx, inPerson]);
+  }, [g.pickIdx, inPerson, ackedAt]);
   useEffect(() => {
     if (done || !turnStarted) return;
     const t = setInterval(() => setNow(Date.now()), 250);
@@ -1425,7 +1680,7 @@ function DraftTab({ g, save, patch }) {
 }
 
 /* Player live draft — can only pick on their turn. */
-function LiveDraft({ g, me, save, patch, onBack, myTurn, pname }) {
+function LiveDraft({ g, me, save, patch, onBack, myTurn, pname, ackedAt }) {
   return (
     <>
       <Header title={g.name} onBack={onBack} sub={`Playing as ${me?.name}`} />
@@ -1435,11 +1690,11 @@ function LiveDraft({ g, me, save, patch, onBack, myTurn, pname }) {
             Waiting for {pname(g.players[g.order[g.pickIdx]]?.id)} to pick…
           </p>
           <p style={{ opacity: 0.5, fontSize: 13, margin: "4px 0 0" }}>
-            Your clock starts the moment it's your turn.
+            Your clock starts when you tap “I’m up” on your turn.
           </p>
         </div>
       )}
-      <DraftBoard g={g} save={save} patch={patch} canPick={myTurn} />
+      <DraftBoard g={g} save={save} patch={patch} canPick={myTurn} ackedAt={ackedAt} />
     </>
   );
 }
@@ -1664,33 +1919,117 @@ function MatchupsTab({ g, save, patch }) {
 
 /* ---------- Standings ---------- */
 /* Rival scoring constants */
-const RIVAL = {
-  beatYourRival: 2,   // +2: your team beats a team your rival owns (each time)
-  beatYourHater: 1,   // +1: your team beats a team owned by someone who picked you
-  ownBothFinalists: 10,
-  speedFastest: 1,
-  speedSlowest: -1,
-  latePenalty: -1,    // last player to accept the invite
+/* ============================================================================
+   SCORING CONFIG — all numeric values exposed here per the core spec.
+   Channels: match points, progression, rivalry, fames/shames.
+   (Undrafted-team penalty intentionally omitted for now.)
+============================================================================ */
+const SCORING = {
+  // Round multiplier — applies to MATCH POINTS only. Plateaus at the final.
+  mult: { group: 1.0, r32: 1.5, r16: 2.0, qf: 3.0, sf: 4.0, final: 4.0 },
+  // Round depth — additive index used by rivalry curves only (NOT a multiplier).
+  depth: { group: 0, r32: 1, r16: 2, qf: 3, sf: 4, final: 5 },
+  // 1. Match points (per team, per match, before the round multiplier).
+  match: { win: 10, tie: 3, loss: -5 },
+  // 2. Progression bonuses (flat, awarded once when a team advances/wins).
+  prog: {
+    outOfGroup: 8,   // reached R32
+    winR32: 12,      // reached R16
+    winR16: 18,      // reached QF
+    winQF: 28,       // reached SF
+    reachFinal: 40,  // reached the final
+    winFinal: 60,    // champion (sole title reward)
+  },
+  // 3. Rivalries (directional). value = base + step * round_depth.
+  rivalry: {
+    h2hWinBase: 8,   h2hWinStep: 5,    // your team beats rival's team
+    h2hLossBase: -8, h2hLossStep: -5,  // your team loses to rival's team
+    schadenBase: 4,  schadenStep: 2,   // knockout only; rival's team loses
+    haterBonus: 2,                     // flat: beat a team owned by someone who
+                                       // picked YOU (and you didn't pick them)
+    netCap: 70,                        // clamp total rivalry to ±70
+  },
+  // 4. Fames / Shames channel cap (labels themselves defined in LEGENDS below).
+  fameShameCap: 25,
 };
-// Legends: performance-based labels. value = points applied. Ties award no label.
-const LEGENDS = [
-  { key: "loser",   label: "Biggest Loser",      value: 1,  emoji: "💀",
-    desc: "Most match losses (teams you own losing)." },
-  { key: "late",    label: "Unfashionably Late", value: -1, emoji: "🐌",
-    desc: "Last to accept the invite." },
-  { key: "shortbus",label: "Short Bus",          value: -1, emoji: "🚌",
-    desc: "Slowest total draft time." },
-  { key: "adhd",    label: "ADHD",               value: 0,  emoji: "⚡",
-    desc: "Fastest total draft time." },
-  { key: "france",  label: "Freedom Fries",      value: -1, emoji: "🍟",
-    desc: "Has France on the roster." },
-  { key: "maga",    label: "Secret MAGA",        value: 0,  emoji: "🦅",
-    desc: "Has the USA on the roster." },
-  { key: "cstudent",label: "C-Student",          value: 2,  emoji: "📝",
-    desc: "Most draws (ties) among teams owned." },
-  { key: "villain", label: "Villain",            value: 0,  emoji: "😈",
-    desc: "Picked as a rival by the most players." },
+
+// Legacy stage-points object kept for any old references / group setup UI.
+const RIVAL = {
+  beatYourRival: 2, beatYourHater: 1, ownBothFinalists: 10,
+  speedFastest: 1, speedSlowest: -1, latePenalty: -1,
+};
+// Fames (+), Shames (-), Legends (0, cosmetic). Each award:
+//   kind: "fame" | "shame" | "legend"
+//   value: point value (legends are 0)
+//   split: if true and N players qualify, value is split evenly (value/N each)
+//   ready: false = trigger needs data not yet wired (team rankings, in-game
+//          lead tracking, group tables); these simply don't fire yet.
+// Order of operations in the engine: split -> sum per player -> clamp ±cap.
+const AWARDS = [
+  // ---- FAMES ----
+  { key: "adhd",     kind: "fame", value: 3, emoji: "⚡", ready: true,  split: true,
+    label: "ADHD", desc: "Fastest drafter." },
+  { key: "loser",    kind: "fame", value: 3, emoji: "💀", ready: true,  split: true,
+    label: "Biggest Loser", desc: "Most match losses across your teams." },
+  { key: "cstudent", kind: "fame", value: 3, emoji: "📝", ready: true,  split: true,
+    label: "C-Student", desc: "Most draws across your teams." },
+  { key: "flawless", kind: "fame", value: 5, emoji: "💯", ready: true,  split: true,
+    label: "Flawless", desc: "A team of yours won all 3 group matches." },
+  { key: "punchup",  kind: "fame", value: 5, emoji: "🥊", ready: false, split: true,
+    label: "Punching Up", desc: "A team ranked outside your top 20 won its group." },
+  { key: "clencher", kind: "fame", value: 5, emoji: "😬", ready: false, split: true,
+    label: "Sphincter Clencher", desc: "Most of your wins came by exactly 1 goal." },
+  { key: "littleman",kind: "fame", value: 8, emoji: "🐜", ready: false, split: true,
+    label: "Little Man Syndrome", desc: "A sub-top-20 team of yours reached the QF." },
+  { key: "laststand",kind: "fame", value: 8, emoji: "🏰", ready: true,  split: true,
+    label: "Last Man Standing", desc: "Only player with a team left in the semis." },
+  { key: "knicks5",  kind: "fame", value: 8, emoji: "🗽", ready: true,  split: true,
+    label: "Knicks in 5!", desc: "A team of yours eliminated France." },
+  { key: "bestfriend",kind: "fame", value: 1, emoji: "🤝", ready: true,  split: true,
+    label: "Turner's Best Friend", desc: "Most recent person to log into the app." },
+  // ---- SHAMES ----
+  { key: "shortbus", kind: "shame", value: -3, emoji: "🚌", ready: true,  split: true,
+    label: "Short Bus", desc: "Slowest drafter." },
+  { key: "token",    kind: "shame", value: -3, emoji: "🎟️", ready: true,  split: true,
+    label: "Token Invite", desc: "Nobody picked you as their rival." },
+  { key: "late",     kind: "shame", value: -3, emoji: "🐌", ready: true,  split: true,
+    label: "Unfashionably Late", desc: "Last to accept the draft invite." },
+  { key: "france",   kind: "shame", value: -5, emoji: "🍟", ready: true,  split: false,
+    label: "Freedom Fries", desc: "Drafted France." },
+  { key: "england",  kind: "shame", value: -5, emoji: "🇬🇧", ready: true,  split: false,
+    label: "Empire Strikes Back", desc: "Drafted England." },
+  { key: "sportwash",kind: "shame", value: -5, emoji: "🛢️", ready: true,  split: false,
+    label: "Sportswashing", desc: "Drafted Saudi Arabia or Qatar." },
+  { key: "remorse",  kind: "shame", value: -5, emoji: "🤦", ready: true,  split: true,
+    label: "Buyer's Remorse", desc: "Your first-round pick is out in the group stage." },
+  { key: "doa",      kind: "shame", value: -5, emoji: "⚰️", ready: false, split: true,
+    label: "Dead on Arrival", desc: "Your first-round pick finished last in its group." },
+  { key: "earlyexit",kind: "shame", value: -5, emoji: "🚪", ready: false, split: true,
+    label: "Early Exit Special", desc: "Most of your teams out in the group stage." },
+  { key: "bottle",   kind: "shame", value: -5, emoji: "🍾", ready: false, split: true,
+    label: "Bottle Job", desc: "A top-5 team of yours missed the semis." },
+  { key: "soclose",  kind: "shame", value: -5, emoji: "😭", ready: true,  split: true,
+    label: "So Close", desc: "A team of yours lost the final." },
+  { key: "bridesmaid",kind: "shame", value: -5, emoji: "💐", ready: true,  split: true,
+    label: "Bridesmaid", desc: "Had a semifinalist but none reached the final." },
+  { key: "choke",    kind: "shame", value: -8, emoji: "🥶", ready: false, split: true,
+    label: "Choke Artist", desc: "A team lost a QF+ match after leading." },
+  { key: "spectator",kind: "shame", value: -8, emoji: "🍿", ready: true,  split: true,
+    label: "Spectator", desc: "None of your teams reached the round of 16." },
+  { key: "selfplay", kind: "shame", value: -5, emoji: "🍆", ready: true,  split: true,
+    label: "Masturbator", desc: "Most played games where both teams were your own." },
+  { key: "sharkhate",kind: "shame", value: -5, emoji: "🦈", ready: true,  split: false,
+    label: "Shark Hates You", desc: "Last person in the group to log into the app." },
+  // ---- LEGENDS (0 pts, cosmetic) ----
+  { key: "villain",  kind: "legend", value: 0, emoji: "😈", ready: true, split: false,
+    label: "Villain", desc: "Picked as a rival by the most players." },
+  { key: "maga",     kind: "legend", value: 0, emoji: "🦅", ready: true, split: false,
+    label: "Secret MAGA", desc: "Drafted the USA." },
+  { key: "vibes",    kind: "legend", value: 0, emoji: "✨", ready: true, split: false,
+    label: "Vibes Only", desc: "Drafted Brazil." },
 ];
+// Back-compat alias: some older code references LEGENDS.
+const LEGENDS = AWARDS;
 const KO_STAGES = ["r32", "r16", "qf", "sf", "final"]; // ascending depth
 
 // Is the draft board open for picking?
@@ -1728,65 +2067,117 @@ function computeStandings(g) {
   g.players.forEach((p) => { rosterSize[p.id] = g.picks.filter((x) => x.playerId === p.id).length; });
   const ownerOf = (team) => g.picks.find((p) => p.team === team)?.playerId;
   const teamsOf = (pid) => g.picks.filter((x) => x.playerId === pid).map((x) => x.team);
-  const stagePts = (k) => g.points[k] ?? DEFAULT_POINTS[k];
   const rivals = g.rivals || {};
-  // reverse map: who picked ME as their rival
-  const haters = {};
-  g.players.forEach((p) => { haters[p.id] = []; });
-  Object.entries(rivals).forEach(([pid, rid]) => { if (haters[rid]) haters[rid].push(pid); });
 
-  const raw = {}, wins = {}, losses = {}, draws = {}, themeB = {}, rivalB = {}, finalB = {}, speedB = {};
+  // Per-player channel accumulators.
+  const matchB = {}, progB = {}, rivalB = {};
+  const winPts = {}, drawPts = {}, matchNeg = {}; // win points / draw points / loss points
+  const wins = {}, losses = {}, draws = {};
   g.players.forEach((p) => {
-    raw[p.id] = wins[p.id] = losses[p.id] = draws[p.id] = 0;
-    themeB[p.id] = rivalB[p.id] = finalB[p.id] = speedB[p.id] = 0;
+    matchB[p.id] = progB[p.id] = rivalB[p.id] = 0;
+    winPts[p.id] = drawPts[p.id] = matchNeg[p.id] = 0;
+    wins[p.id] = losses[p.id] = draws[p.id] = 0;
   });
-  const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
 
   const ko = g.koGames || [];
   const allGames = [...groupStageFixtures(), ...ko];
+  // Results are shared across all groups.
+  const sharedResults = { ...(g.results || {}), ...RESULTS.get() };
+  const M = SCORING.mult, D = SCORING.depth, MP = SCORING.match, PR = SCORING.prog, RV = SCORING.rivalry;
+
+  // Helper: rounds a player owns a rival relationship with the loser's owner.
+  const isMyRival = (me, other) => rivals[me] === other;
+
   for (const game of allGames) {
-    const res = g.results[game.id];
+    const res = sharedResults[game.id];
     if (!res) continue;
+    const stage = game.stage;
+    const mult = M[stage] ?? 1;
+    const depth = D[stage] ?? 0;
     const hOwn = ownerOf(game.home), aOwn = ownerOf(game.away);
-    if (res === "DRAW") {
-      // a tie: both owners get a draw tally (for C-Student), no win points
-      if (hOwn) draws[hOwn] += 1;
-      if (aOwn) draws[aOwn] += 1;
-      continue;
+
+    // ---- Channel 1: match points (both teams, per result) ----
+    if (isDraw(res)) {
+      if (hOwn) { matchB[hOwn] += MP.tie * mult; drawPts[hOwn] += MP.tie * mult; draws[hOwn] += 1; }
+      if (aOwn) { matchB[aOwn] += MP.tie * mult; drawPts[aOwn] += MP.tie * mult; draws[aOwn] += 1; }
+      continue; // a tie cannot happen in knockouts; no winner/progression
     }
-    const w = res;
+    const w = winnerOf(res);
+    if (!w) continue;
     const loser = game.home === w ? game.away : game.home;
-    const own = ownerOf(w), loserOwner = ownerOf(loser);
-    if (own) {
-      raw[own] += stagePts(game.stage);
-      wins[own] += 1;
-      themeB[own] += theme.bonus(loser, w);
-      if (loserOwner) {
-        // NEW rival scoring: +2 each time you beat a team your rival owns,
-        // +1 each time you beat a team owned by someone who picked you.
-        if (rivals[own] === loserOwner) rivalB[own] += RIVAL.beatYourRival;
-        if ((haters[own] || []).includes(loserOwner)) rivalB[own] += RIVAL.beatYourHater;
-      }
+    const wOwn = ownerOf(w), lOwn = ownerOf(loser);
+    if (wOwn) { matchB[wOwn] += MP.win * mult; winPts[wOwn] += MP.win * mult; wins[wOwn] += 1; }
+    if (lOwn) { matchB[lOwn] += MP.loss * mult; matchNeg[lOwn] += MP.loss * mult; losses[lOwn] += 1; }
+
+    // ---- Channel 2 (progression) is computed separately below from knockout
+    // results, so nothing to do here in the per-game loop. ----
+
+    // ---- Channel 3a: head-to-head rivalry (any stage) ----
+    // Evaluate directionally for BOTH owners involved.
+    if (wOwn && lOwn && wOwn !== lOwn) {
+      const winnerPickedLoser = isMyRival(wOwn, lOwn); // wOwn -> lOwn
+      const loserPickedWinner = isMyRival(lOwn, wOwn); // lOwn -> wOwn
+      // winner's perspective: did winner's rival own the loser? -> H2H win
+      if (winnerPickedLoser) rivalB[wOwn] += RV.h2hWinBase + RV.h2hWinStep * depth;
+      // loser's perspective: did loser's rival own the winner? -> H2H loss
+      if (loserPickedWinner) rivalB[lOwn] += RV.h2hLossBase + RV.h2hLossStep * depth;
+      // Hater bonus: the winner beat someone who picked THEM as a rival, but the
+      // winner did NOT pick that person (one-directional). Mutual rivals get the
+      // H2H win above instead, not this.
+      if (loserPickedWinner && !winnerPickedLoser) rivalB[wOwn] += RV.haterBonus;
     }
-    if (loserOwner) losses[loserOwner] += 1;
   }
 
-  // Which teams reached each knockout round (for own-both-finalists)
-  const reachedFinal = new Set();
+  // ---- Channel 2: progression ----
+  // out-of-group: any owned team that reached the knockouts (+8 once).
+  // knockout wins: award the bonus for the round that was won.
+  const advancedTeams = new Set();
+  for (const game of ko) { advancedTeams.add(game.home); advancedTeams.add(game.away); }
+  advancedTeams.forEach((team) => { const o = ownerOf(team); if (o) progB[o] += PR.outOfGroup; });
   for (const game of ko) {
-    if (game.stage === "final") { reachedFinal.add(game.home); reachedFinal.add(game.away); }
-  }
-  if (reachedFinal.size >= 2) {
-    const owners = [...reachedFinal].map(ownerOf);
-    if (owners[0] && owners[0] === owners[1]) finalB[owners[0]] += RIVAL.ownBothFinalists;
+    const res = sharedResults[game.id];
+    if (!res) continue;
+    const w = winnerOf(res); if (!w) continue;
+    const wOwn = ownerOf(w); if (!wOwn) continue;
+    if (game.stage === "r32") progB[wOwn] += PR.winR32;
+    else if (game.stage === "r16") progB[wOwn] += PR.winR16;
+    else if (game.stage === "qf") progB[wOwn] += PR.winQF;
+    else if (game.stage === "sf") progB[wOwn] += PR.reachFinal;
+    else if (game.stage === "final") progB[wOwn] += PR.winFinal;
   }
 
-  // Draft speed: fastest total time +1, slowest -1
+  // ---- Channel 3b: schadenfreude (KNOCKOUTS ONLY) ----
+  // Each time your rival's team loses in a knockout, +base+step*depth, UNLESS
+  // you already got the H2H credit for that exact match (your team beat them).
+  for (const game of ko) {
+    const res = sharedResults[game.id];
+    if (!res) continue;
+    const w = winnerOf(res); if (!w) continue;
+    const loser = game.home === w ? game.away : game.home;
+    const wOwn = ownerOf(w), lOwn = ownerOf(loser);
+    const depth = D[game.stage] ?? 0;
+    if (!lOwn) continue; // rival's team must be owned to be someone's rival
+    // who has lOwn as their rival? each such player gets schadenfreude...
+    g.players.forEach((p) => {
+      if (rivals[p.id] !== lOwn) return;           // p's rival owns the loser
+      // ...unless p is the winner's owner AND already got H2H for this match
+      const gotH2H = (p.id === wOwn) && isMyRival(wOwn, lOwn);
+      if (gotH2H) return;
+      rivalB[p.id] += RV.schadenBase + RV.schadenStep * depth;
+    });
+  }
+
+  // ---- Rivalry net cap ±70 ----
+  g.players.forEach((p) => {
+    rivalB[p.id] = Math.max(-RV.netCap, Math.min(RV.netCap, rivalB[p.id]));
+  });
+
+  // ---- Channel 4: Fames/Shames (labels), clamped to ±cap ----
   const dt = g.draftTime || {};
   const drafted = g.picks.length === ALL_TEAMS.length;
   const timed = g.players.filter((p) => dt[p.id] != null);
   let fastestId = null, slowestId = null;
-  if (timed.length === g.players.length && g.players.length >= 2) {
+  if (drafted && timed.length === g.players.length && g.players.length >= 2) {
     let fast = timed[0], slow = timed[0];
     for (const p of timed) {
       if (dt[p.id] < dt[fast.id]) fast = p;
@@ -1794,133 +2185,242 @@ function computeStandings(g) {
     }
     if (fast.id !== slow.id) { fastestId = fast.id; slowestId = slow.id; }
   }
-  if (drafted && fastestId && slowestId) {
-    speedB[fastestId] += RIVAL.speedFastest;
-    speedB[slowestId] += RIVAL.speedSlowest;
-  }
-
-  // Unfashionably late: last player to accept the invite (remote only).
-  const lateB = {};
-  g.players.forEach((p) => { lateB[p.id] = 0; });
   let lateId = null;
   if (g.mode !== "inperson" && draftIsOpen(g)) {
     const lid = lastAccepter(g);
     if (lid && Object.keys(g.accepted || {}).length >= 2) lateId = lid;
   }
+  const legends = computeLegends(g, { losses, draws, dt, teamsOf, rivals,
+    fastestId, slowestId, lateId, timed, drafted, sharedResults, ownerOf });
 
-  // ---- Legends: award labels (ties award nothing) ----
-  const legends = computeLegends(g, {
-    losses, draws, dt, teamsOf, rivals, fastestId, slowestId, lateId, timed, drafted,
+  // ---- Split-points: an award held by N players is worth value/N to each.
+  // Order: split -> sum per player -> clamp ±cap. ----
+  // Count holders per award key across all players.
+  const holderCount = {};
+  Object.values(legends).forEach((awards) => {
+    awards.forEach((a) => { holderCount[a.key] = (holderCount[a.key] || 0) + 1; });
   });
-  // Apply legend point effects per player
-  const legendB = {};
-  g.players.forEach((p) => { legendB[p.id] = 0; });
-  Object.entries(legends).forEach(([pid, labels]) => {
-    labels.forEach((l) => { legendB[pid] += l.value; });
+  const fameRaw = {};
+  g.players.forEach((p) => { fameRaw[p.id] = 0; });
+  Object.entries(legends).forEach(([pid, awards]) => {
+    awards.forEach((a) => {
+      const n = a.split ? (holderCount[a.key] || 1) : 1; // non-split: full value each
+      fameRaw[pid] += a.value / n;
+    });
   });
-  // lateB still drives the standings late chip; mirror from legend if present
-  if (lateId) lateB[lateId] += RIVAL.latePenalty;
+  const fameB = {};
+  g.players.forEach((p) => {
+    const capped = Math.max(-SCORING.fameShameCap, Math.min(SCORING.fameShameCap, fameRaw[p.id]));
+    fameB[p.id] = Math.round(capped * 10) / 10;
+  });
 
   return g.players.map((p) => {
-    const size = rosterSize[p.id] || 1;
-    const mult = ALL_TEAMS.length / size;
-    const scaled = raw[p.id] * mult;
-    const bonus = themeB[p.id] + rivalB[p.id] + finalB[p.id]
-      + speedB[p.id] + legendB[p.id];
+    const total = matchB[p.id] + progB[p.id] + rivalB[p.id] + fameB[p.id];
     return {
-      id: p.id, name: p.name, roster: size,
+      id: p.id, name: p.name, roster: rosterSize[p.id] || 0,
       wins: wins[p.id], losses: losses[p.id], draws: draws[p.id],
-      raw: raw[p.id], bonus,
-      themeB: themeB[p.id], rivalB: rivalB[p.id],
-      finalB: finalB[p.id], speedB: speedB[p.id], legendB: legendB[p.id],
+      // channel breakdown
+      matchB: Math.round(matchB[p.id] * 10) / 10,
+      winPts: Math.round(winPts[p.id] * 10) / 10,
+      drawPts: Math.round(drawPts[p.id] * 10) / 10,
+      matchNeg: Math.round(matchNeg[p.id] * 10) / 10,
+      progB: progB[p.id],
+      rivalB: rivalB[p.id],
+      fameB: fameB[p.id],
       legends: legends[p.id] || [],
-      total: Math.round((scaled + bonus) * 10) / 10,
-      mult: Math.round(mult * 100) / 100,
+      total: Math.round(total * 10) / 10,
     };
   }).sort((a, b) => b.total - a.total);
 }
 
-// Decide who (if anyone) earns each legend label. Ties = no award.
+// Compute which awards each player earns. Returns { playerId: [awardObj,...] }.
+// Multiple players can hold the same award (split handled later in the engine).
+// Only awards flagged ready:true can fire; the rest await unbuilt data.
 function computeLegends(g, ctx) {
-  const { losses, draws, dt, teamsOf, rivals, fastestId, slowestId, lateId, timed, drafted } = ctx;
+  const { losses, draws, dt, teamsOf, rivals, fastestId, slowestId, lateId,
+    timed, drafted, sharedResults, ownerOf } = ctx;
   const out = {};
   g.players.forEach((p) => { out[p.id] = []; });
-  const byKey = Object.fromEntries(LEGENDS.map((l) => [l.key, l]));
+  const byKey = Object.fromEntries(AWARDS.map((a) => [a.key, a]));
+  const give = (pid, key) => { const a = byKey[key]; if (a && a.ready) out[pid].push(a); };
 
-  // helper: unique argmax over a numeric map for the given player ids; null on tie/zero
-  const uniqueMax = (vals, { requirePositive = true } = {}) => {
-    let best = -Infinity, who = null, tie = false;
-    for (const p of g.players) {
-      const v = vals[p.id] || 0;
-      if (v > best) { best = v; who = p.id; tie = false; }
-      else if (v === best) tie = true;
-    }
-    if (tie) return null;
-    if (requirePositive && best <= 0) return null;
-    return who;
+  // ---- per-team result facts from shared results ----
+  const fixtures = groupStageFixtures();
+  const ko = g.koGames || [];
+  // group record per team
+  const groupRec = {}; // team -> {w,d,l,played}
+  const ensure = (t) => (groupRec[t] = groupRec[t] || { w: 0, d: 0, l: 0, played: 0 });
+  for (const gm of fixtures) {
+    const res = sharedResults[gm.id]; if (!res) continue;
+    ensure(gm.home); ensure(gm.away);
+    groupRec[gm.home].played++; groupRec[gm.away].played++;
+    if (isDraw(res)) { groupRec[gm.home].d++; groupRec[gm.away].d++; continue; }
+    const w = winnerOf(res); if (!w) continue;
+    const l = gm.home === w ? gm.away : gm.home;
+    groupRec[w].w++; groupRec[l].l++;
+  }
+  // which teams reached each KO stage (appeared in a game of that stage)
+  const reached = {}; KO_STAGES.forEach((s) => { reached[s] = new Set(); });
+  for (const gm of ko) { if (reached[gm.stage]) { reached[gm.stage].add(gm.home); reached[gm.stage].add(gm.away); } }
+  // teams that LOST the final
+  const finalLosers = new Set();
+  for (const gm of ko) {
+    if (gm.stage !== "final") continue;
+    const res = sharedResults[gm.id]; if (!res) continue;
+    const w = winnerOf(res); if (!w) continue;
+    finalLosers.add(gm.home === w ? gm.away : gm.home);
+  }
+  // teams a player eliminated (their team beat France, for Knicks in 5)
+  const eliminatedFranceBy = new Set();
+  // self-play: played games where both teams are owned by the same player
+  const selfPlayCount = {}; g.players.forEach((p) => { selfPlayCount[p.id] = 0; });
+  for (const gm of [...fixtures, ...ko]) {
+    const res = sharedResults[gm.id]; if (!res) continue;
+    const ho = ownerOf(gm.home), ao = ownerOf(gm.away);
+    if (ho && ho === ao) selfPlayCount[ho] += 1;
+    const w = winnerOf(res); if (!w) continue;
+    const loser = gm.home === w ? gm.away : gm.home;
+    // "eliminates France" — count any knockout loss by France, or a group loss too (kept simple: any defeat)
+    if (loser === "France") { const o = ownerOf(w); if (o) eliminatedFranceBy.add(o); }
+  }
+
+  // ---- multi-qualifier argmax: ALL tied at the positive max qualify ----
+  const allMax = (vals) => {
+    let best = -Infinity;
+    g.players.forEach((p) => { const v = vals[p.id] || 0; if (v > best) best = v; });
+    if (best <= 0) return [];
+    return g.players.filter((p) => (vals[p.id] || 0) === best).map((p) => p.id);
   };
 
-  // Biggest Loser — most losses
-  const loserId = uniqueMax(losses);
-  if (loserId) out[loserId].push(byKey.loser);
+  // FAMES (draft + result based)
+  if (fastestId) give(fastestId, "adhd");
+  allMax(losses).forEach((pid) => give(pid, "loser"));
+  allMax(draws).forEach((pid) => give(pid, "cstudent"));
 
-  // C-Student — most draws
-  const csId = uniqueMax(draws);
-  if (csId) out[csId].push(byKey.cstudent);
-
-  // Villain — picked as rival by the most players
-  const rivalCounts = {};
-  g.players.forEach((p) => { rivalCounts[p.id] = 0; });
-  Object.values(rivals).forEach((rid) => { if (rid && rivalCounts[rid] != null) rivalCounts[rid] += 1; });
-  const villainId = uniqueMax(rivalCounts);
-  if (villainId) out[villainId].push(byKey.villain);
-
-  // Short Bus / ADHD — slowest / fastest draft (only when everyone timed)
-  if (slowestId) out[slowestId].push(byKey.shortbus);
-  if (fastestId) out[fastestId].push(byKey.adhd);
-
-  // Unfashionably Late
-  if (lateId) out[lateId].push(byKey.late);
-
-  // Freedom Fries — has France; Secret MAGA — has USA (roster facts, can co-occur)
+  // Flawless — any team of yours won all 3 group games
   g.players.forEach((p) => {
-    const teams = teamsOf(p.id);
-    if (teams.includes("France")) out[p.id].push(byKey.france);
-    if (teams.includes("United States")) out[p.id].push(byKey.maga);
+    const mine = teamsOf(p.id);
+    if (mine.some((t) => groupRec[t] && groupRec[t].w === 3)) give(p.id, "flawless");
   });
+
+  // Knicks in 5! — a team of yours eliminated France
+  eliminatedFranceBy.forEach((pid) => give(pid, "knicks5"));
+
+  // Last Man Standing — only player with a team in the semis
+  const semiOwners = new Set();
+  reached.sf.forEach((t) => { const o = ownerOf(t); if (o) semiOwners.add(o); });
+  if (semiOwners.size === 1) give([...semiOwners][0], "laststand");
+
+  // Login-based awards: Turner's Best Friend (most recent login, +1, splits) and
+  // Shark Hates You (last/least-recent login, -5, no split). Never-logged-in
+  // players count as the oldest (timestamp 0).
+  const lastLogin = g.lastLogin || {};
+  const loginTs = (pid) => lastLogin[pid] || 0;
+  if (g.players.length > 0) {
+    let newest = -Infinity, oldest = Infinity;
+    g.players.forEach((p) => {
+      const t = loginTs(p.id);
+      if (t > newest) newest = t;
+      if (t < oldest) oldest = t;
+    });
+    // Best Friend only fires if at least one player has actually logged in.
+    if (newest > 0) {
+      g.players.forEach((p) => { if (loginTs(p.id) === newest) give(p.id, "bestfriend"); });
+    }
+    // Shark Hates You: everyone tied at the oldest login (incl. never-logged-in).
+    // Only when there's a real spread (newest !== oldest), so a single player or
+    // an all-equal group doesn't get shamed.
+    if (newest !== oldest) {
+      g.players.forEach((p) => { if (loginTs(p.id) === oldest) give(p.id, "sharkhate"); });
+    }
+  }
+
+  // SHAMES (draft based)
+  if (slowestId) give(slowestId, "shortbus");
+  if (lateId) give(lateId, "late");
+  // Masturbator — most played games where both teams were your own (≥1 to qualify)
+  allMax(selfPlayCount).forEach((pid) => give(pid, "selfplay"));
+  // Token Invite — nobody picked you as their rival
+  const rivalCounts = {}; g.players.forEach((p) => { rivalCounts[p.id] = 0; });
+  Object.values(rivals).forEach((rid) => { if (rid && rivalCounts[rid] != null) rivalCounts[rid] += 1; });
+  // Villain (legend) — picked by the MOST players, and only if they stand out
+  // (a strict max above the runner-up). If everyone's equally picked, no villain.
+  const counts = g.players.map((p) => rivalCounts[p.id] || 0);
+  const maxC = Math.max(...counts, 0);
+  const atMax = g.players.filter((p) => (rivalCounts[p.id] || 0) === maxC);
+  const villains = (maxC > 0 && atMax.length < g.players.length) ? atMax.map((p) => p.id) : [];
+  villains.forEach((pid) => give(pid, "villain"));
+  // Token Invite — zero rival-picks (and not somehow also the villain)
+  g.players.forEach((p) => {
+    if ((rivalCounts[p.id] || 0) === 0 && !villains.includes(p.id)) give(p.id, "token");
+  });
+
+  // Roster-fact shames/legends (each fires independently; no split)
+  g.players.forEach((p) => {
+    const mine = teamsOf(p.id);
+    if (mine.includes("France")) give(p.id, "france");
+    if (mine.includes("England")) give(p.id, "england");
+    if (mine.includes("Saudi Arabia") || mine.includes("Qatar")) give(p.id, "sportwash");
+    if (mine.includes("United States")) give(p.id, "maga");
+    if (mine.includes("Brazil")) give(p.id, "vibes");
+  });
+
+  // Buyer's Remorse — your first-round pick is out in the group stage.
+  // first-round pick = each player's earliest pick (lowest at / first in picks order)
+  const firstPickOf = {};
+  g.players.forEach((p) => {
+    const mine = g.picks.filter((x) => x.playerId === p.id);
+    if (mine.length) firstPickOf[p.id] = mine[0].team; // picks are in draft order
+  });
+  // a team is "out in group stage" if it played all 3 and did NOT reach R32
+  const inKnockouts = new Set(); ko.forEach((gm) => { inKnockouts.add(gm.home); inKnockouts.add(gm.away); });
+  g.players.forEach((p) => {
+    const t = firstPickOf[p.id]; if (!t) return;
+    const rec = groupRec[t];
+    if (rec && rec.played >= 3 && !inKnockouts.has(t)) give(p.id, "remorse");
+  });
+
+  // So Close — a team of yours lost the final
+  g.players.forEach((p) => {
+    if (teamsOf(p.id).some((t) => finalLosers.has(t))) give(p.id, "soclose");
+  });
+  // Bridesmaid — you had a semifinalist but none of your teams reached the final
+  const finalists = reached.final;
+  g.players.forEach((p) => {
+    const mine = teamsOf(p.id);
+    const hadSemi = mine.some((t) => reached.sf.has(t));
+    const hadFinal = mine.some((t) => finalists.has(t));
+    if (hadSemi && !hadFinal) give(p.id, "bridesmaid");
+  });
+  // Spectator — none of your teams reached the round of 16.
+  // Only meaningful once knockouts exist; require r16 to have started.
+  if (reached.r16.size > 0) {
+    g.players.forEach((p) => {
+      const mine = teamsOf(p.id);
+      if (!mine.some((t) => reached.r16.has(t))) give(p.id, "spectator");
+    });
+  }
 
   return out;
 }
-function StandingsTab({ g, highlightId }) {
+function StandingsTab({ g, highlightId, onOpenPlayer }) {
   const rows = useMemo(() => computeStandings(g), [g]);
   const leader = rows[0]?.total || 0;
-  const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
   return (
     <>
-      <div style={{ ...card, padding: "12px 14px", marginBottom: 14,
-        borderColor: S.accent, display: "flex", gap: 10, alignItems: "flex-start" }}>
-        <span style={{ fontSize: 18 }}>⭐</span>
-        <div>
-          <div style={{ fontWeight: 700, fontSize: 14 }}>{theme.label}</div>
-          <div style={{ fontSize: 12.5, opacity: 0.6, marginTop: 2, lineHeight: 1.4 }}>
-            {theme.blurb} <span style={{ opacity: 0.8 }}>(+{theme.amount} each)</span>
-          </div>
-        </div>
-      </div>
       <p style={{ fontSize: 13, opacity: 0.55, margin: "0 0 16px", lineHeight: 1.5 }}>
-        Total = (win points × 48 ÷ roster size) + bonuses. Tap a player for the breakdown.
+        Total = match points + progression + rivalry + fames/shames. Tap a player to see their page.
       </p>
       {rows.map((r, i) => {
         const chips = [];
-        if (r.themeB) chips.push(["twist", r.themeB]);
-        if (r.rivalB) chips.push(["rivals", r.rivalB]);
-        if (r.finalB) chips.push(["both finalists", r.finalB]);
-        if (r.speedB) chips.push([r.speedB > 0 ? "fastest draft" : "slowest draft", r.speedB]);
-        if (r.legendB) chips.push(["legends", r.legendB]);
+        if (r.progB) chips.push(["progression", r.progB]);
+        if (r.rivalB) chips.push(["rivalry", r.rivalB]);
+        if (r.fameB) chips.push([r.fameB >= 0 ? "fames" : "shames", r.fameB]);
         const barPct = leader > 0 ? Math.max(0, (r.total / leader) * 100) : 0;
         return (
-        <div key={r.id} style={{ ...card, marginBottom: 8, display: "flex",
-          alignItems: "center", gap: 14,
+        <div key={r.id} onClick={() => onOpenPlayer && onOpenPlayer(r.id)}
+          style={{ ...card, marginBottom: 8, display: "flex",
+          alignItems: "center", gap: 14, cursor: onOpenPlayer ? "pointer" : "default",
           borderColor: r.id === highlightId ? S.accent : "#222d47",
           background: r.id === highlightId ? S.card2 : S.card }}>
           <div style={{ fontSize: 22, fontWeight: 800, width: 28, textAlign: "center",
@@ -1930,7 +2430,7 @@ function StandingsTab({ g, highlightId }) {
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontWeight: 700, fontSize: 16 }}>{r.name}</div>
             <div style={{ fontSize: 12, opacity: 0.5, marginTop: 2 }}>
-              {r.wins} wins · {r.roster} teams · ×{r.mult}
+              {r.wins}W · {r.draws}D · {r.losses}L · {r.roster} teams
             </div>
             {chips.length > 0 && (
               <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 5 }}>
@@ -1950,9 +2450,12 @@ function StandingsTab({ g, highlightId }) {
                 background: S.accent, borderRadius: 3 }} />
             </div>
           </div>
-          <div style={{ fontWeight: 800, fontSize: 22, fontVariantNumeric: "tabular-nums",
-            color: r.total < 0 ? "#ff8095" : S.ink }}>
-            {r.total}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <div style={{ fontWeight: 800, fontSize: 22, fontVariantNumeric: "tabular-nums",
+              color: r.total < 0 ? "#ff8095" : S.ink }}>
+              {r.total}
+            </div>
+            {onOpenPlayer && <span style={{ opacity: 0.3, fontSize: 16 }}>›</span>}
           </div>
         </div>
         );
@@ -1961,7 +2464,25 @@ function StandingsTab({ g, highlightId }) {
   );
 }
 
-/* ---------- Player dashboard: Roster / Upcoming / Standings ---------- */
+// A sortable numeric key for a fixture: date + kickoff time combined.
+// Parses the 12-hour "9:00 PM" time into 24-hour minutes so games sort in the
+// real order they kick off, not just by date. Games with no time sort last
+// within their day; games with no date sort to the very end.
+function gameSortKey(gm) {
+  if (!gm || !gm.date) return Number.MAX_SAFE_INTEGER;
+  const base = new Date(gm.date + "T00:00:00").getTime();
+  let mins = 24 * 60; // default: end of day if time missing
+  if (gm.time) {
+    const m = gm.time.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    if (m) {
+      let h = parseInt(m[1], 10) % 12;
+      if (/PM/i.test(m[3])) h += 12;
+      mins = h * 60 + parseInt(m[2], 10);
+    }
+  }
+  return base + mins * 60 * 1000;
+}
+/* ---------- Player dashboard: Roster / Upcoming / Home ---------- */
 function fmtDate(iso) {
   if (!iso) return "TBD";
   const d = new Date(iso + "T12:00:00");
@@ -2133,7 +2654,7 @@ function DraftStartingSoon({ g, onOk, onBack }) {
           <li>Next you'll pick a <strong>rival</strong> — beat their teams for bonus points.</li>
           <li>The <strong>fastest</strong> overall drafter earns +{RIVAL.speedFastest}, the
             slowest loses {Math.abs(RIVAL.speedSlowest)}. Don't dawdle on your picks.</li>
-          <li>Watch out for <strong>Legends</strong> — performance labels that add or subtract points.</li>
+          <li>Watch out for <strong>Fames &amp; Shames</strong> — badges that add or subtract points.</li>
         </ul>
       </div>
 
@@ -2167,9 +2688,13 @@ function YoureUp({ g, me, onStart, onBack }) {
         lineHeight: 1.5, padding: "8px 12px", borderRadius: 10, background: S.card2 }}>
         ⚡ {theme.label}: {theme.blurb}
       </div>
+      <p style={{ fontSize: 12, opacity: 0.55, margin: "0 0 14px", maxWidth: 320 }}>
+        Your clock starts the instant you tap, and stops when you confirm your pick.
+        Fastest total drafter earns an award; slowest gets shamed.
+      </p>
       <button className="primary" onClick={onStart}
         style={{ width: "100%", maxWidth: 360, padding: 16, fontSize: 17 }}>
-        Make my pick →
+        I'm up — start my clock →
       </button>
       <button className="ghost" onClick={onBack}
         style={{ marginTop: 10, fontSize: 13 }}>Back</button>
@@ -2314,9 +2839,24 @@ function ReadyLobby({ g, me, pname, onBack }) {
 }
 function PlayerView({ id, phone, playerId, onBack }) {
   const [page, setPage] = useState("standings");
+  const [viewedPlayer, setViewedPlayer] = useState(null); // playerId whose page is open
   const [showHistory, setShowHistory] = useState(false);
   const [ackedPick, setAckedPick] = useState(-1); // last pickIdx the player tapped "YOU'RE UP" for
+  const [ackedAt, setAckedAt] = useState(null); // timestamp the player tapped it (clock start)
   const { g, notFound: missing, save, patch } = usePolledGroup(id);
+  useSharedResults(); // re-render this view when any shared score changes
+
+  // Record this player's last login on the group (once per mount).
+  const me0 = g && (playerId
+    ? g.players.find((p) => p.id === playerId)
+    : g.players.find((p) => normPhone(p.phone) === phone));
+  const loggedRef = React.useRef(false);
+  useEffect(() => {
+    if (!g || !me0 || loggedRef.current) return;
+    loggedRef.current = true;
+    // atomic server-side write so it can't clobber concurrent updates
+    STORAGE.patch(g.id, { op: "lastLogin", playerId: me0.id });
+  }, [g, me0]);
 
   if (missing) return (
     <div style={{ ...card, textAlign: "center", marginTop: 32 }}>
@@ -2361,8 +2901,6 @@ function PlayerView({ id, phone, playerId, onBack }) {
   }
   async function markReady() {
     const r = await patch({ op: "draftReady", playerId: me.id });
-    // If the server echo doesn't reflect the change (e.g. an older route that
-    // ignores this op), force it through a whole-object save so the UI advances.
     if (!r || !(r.draftReady || {})[me.id]) {
       await save({ ...g, draftReady: { ...(g.draftReady || {}), [me.id]: Date.now() } });
     }
@@ -2402,11 +2940,13 @@ function PlayerView({ id, phone, playerId, onBack }) {
     // Step 5: live draft — timer only runs now that everyone is ready.
     const myTurn = g.order[g.pickIdx] === g.players.findIndex((p) => p.id === me?.id);
     if (myTurn && ackedPick !== g.pickIdx) {
-      return <YoureUp g={g} me={me} onStart={() => setAckedPick(g.pickIdx)} onBack={onBack} />;
+      return <YoureUp g={g} me={me}
+        onStart={() => { setAckedAt(Date.now()); setAckedPick(g.pickIdx); }} onBack={onBack} />;
     }
     return (
       <LiveDraft g={g} me={me} save={save} patch={patch} onBack={onBack}
-        myTurn={myTurn} pname={pname} />
+        myTurn={myTurn} pname={pname}
+        ackedAt={ackedPick === g.pickIdx ? ackedAt : null} />
     );
   }
   // In-person: the draft runs on the shared phone. A player opening their own
@@ -2436,20 +2976,27 @@ function PlayerView({ id, phone, playerId, onBack }) {
 
       {page === "standings" && (
         <StandingsHome g={g} meId={me?.id} ownerOf={ownerOf} pname={pname}
-          onOpen={(pg) => setPage(pg)} />
+          onOpen={(pg) => setPage(pg)}
+          onOpenPlayer={(pid) => { setViewedPlayer(pid); setPage("playerPage"); }} />
+      )}
+      {page === "playerPage" && (
+        <DashSection title={pname(viewedPlayer)} onBack={() => setPage("standings")}>
+          <PlayerPage g={g} playerId={viewedPlayer} meId={me?.id} ownerOf={ownerOf} pname={pname}
+            onOpenAwards={() => setPage("legends")} />
+        </DashSection>
       )}
       {page === "roster" && (
-        <DashSection title="Roster" onBack={() => setPage("standings")}>
+        <DashSection title="My Roster" onBack={() => setPage("standings")}>
           <PlayerRoster g={g} myTeams={myTeams} />
         </DashSection>
       )}
       {page === "upcoming" && (
-        <DashSection title="Upcoming" onBack={() => setPage("standings")}>
+        <DashSection title="Games" onBack={() => setPage("standings")}>
           <PlayerUpcoming g={g} myTeamSet={myTeamSet} ownerOf={ownerOf} pname={pname} meId={me?.id} />
         </DashSection>
       )}
       {page === "legends" && (
-        <DashSection title="Legends" onBack={() => setPage("standings")}>
+        <DashSection title="Fames & Shames" onBack={() => setPage("standings")}>
           <LegendsPage g={g} meId={me?.id} pname={pname} />
         </DashSection>
       )}
@@ -2468,12 +3015,12 @@ function PlayerView({ id, phone, playerId, onBack }) {
   );
 }
 
-/* Simple section wrapper with a back-to-standings control. */
+/* Simple section wrapper with a back-to-home control. */
 function DashSection({ title, onBack, children }) {
   return (
     <>
       <button className="ghost" onClick={onBack}
-        style={{ marginBottom: 12, fontSize: 13 }}>← Standings</button>
+        style={{ marginBottom: 12, fontSize: 13 }}>← Home</button>
       <div style={{ ...lbl, marginBottom: 10 }}>{title}</div>
       {children}
     </>
@@ -2481,15 +3028,15 @@ function DashSection({ title, onBack, children }) {
 }
 
 /* Standings home: leaderboard + next game + 2x2 nav + rivalries button. */
-function StandingsHome({ g, meId, ownerOf, pname, onOpen }) {
+function StandingsHome({ g, meId, ownerOf, pname, onOpen, onOpenPlayer }) {
   const next = useMemo(() => nextUpcomingGame(g), [g]);
   const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
   // show the special rule only if the next game involves a country it applies to
   const themeApplies = next && theme.targets &&
     (theme.targets.includes(next.home) || theme.targets.includes(next.away));
   const nav = [
-    ["roster", "Roster", "📋"], ["upcoming", "Upcoming", "📅"],
-    ["legends", "Legends", "🏷️"], ["competition", "Competition", "🌍"],
+    ["roster", "My Roster", "📋"], ["upcoming", "Games", "📅"],
+    ["legends", "Fames & Shames", "🏷️"], ["competition", "Competition", "🌍"],
   ];
   return (
     <>
@@ -2514,7 +3061,7 @@ function StandingsHome({ g, meId, ownerOf, pname, onOpen }) {
       )}
 
       {/* Leaderboard */}
-      <StandingsTab g={g} highlightId={meId} />
+      <StandingsTab g={g} highlightId={meId} onOpenPlayer={onOpenPlayer} />
 
       {/* 2x2 nav */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 18 }}>
@@ -2710,7 +3257,7 @@ function ScoringRules({ g, theme }) {
         <Rule pts={RIVAL.ownBothFinalists}>You drafted both teams in the final.</Rule>
       </Section>
 
-      <Section title="Legends">
+      <Section title="Awards & Shame">
         {LEGENDS.map((l) => (
           <Rule key={l.key} pts={l.value}>{l.emoji} {l.label} — {l.desc}</Rule>
         ))}
@@ -2734,10 +3281,19 @@ function ScoringRules({ g, theme }) {
 }
 
 function PlayerRoster({ g, myTeams }) {
-  const results = g.results || {};
+  const results = { ...(g.results || {}), ...RESULTS.get() };
   const allGames = [...groupStageFixtures(), ...(g.koGames || [])];
-  const teamWins = (team) => allGames.filter((gm) =>
-    results[gm.id] === team).length;
+  const teamRecord = (team) => {
+    let w = 0, d = 0, l = 0;
+    for (const gm of allGames) {
+      if (gm.home !== team && gm.away !== team) continue;
+      const res = results[gm.id]; if (!res) continue;
+      if (isDraw(res)) { d++; continue; }
+      const win = winnerOf(res); if (!win) continue;
+      if (win === team) w++; else l++;
+    }
+    return { w, d, l };
+  };
   return (
     <>
       <div style={{ ...card, marginBottom: 14, display: "flex",
@@ -2748,7 +3304,8 @@ function PlayerRoster({ g, myTeams }) {
       {myTeams.length === 0 ? (
         <div style={{ ...card, textAlign: "center", opacity: 0.6 }}>No teams on your roster.</div>
       ) : myTeams.map((team) => {
-        const w = teamWins(team);
+        const rec = teamRecord(team);
+        const played = rec.w + rec.d + rec.l;
         return (
           <div key={team} style={{ ...card, padding: "12px 14px", marginBottom: 8,
             display: "flex", alignItems: "center", gap: 12 }}>
@@ -2759,9 +3316,14 @@ function PlayerRoster({ g, myTeams }) {
                 Group {ALL_TEAMS.find((t) => t.name === team)?.group}
               </div>
             </div>
-            <div style={{ textAlign: "right" }}>
-              <div style={{ fontWeight: 800, fontSize: 18 }}>{w}</div>
-              <div style={{ fontSize: 11, opacity: 0.5 }}>wins</div>
+            <div style={{ display: "flex", gap: 6, fontWeight: 800, fontSize: 14 }}>
+              {played === 0
+                ? <span style={{ opacity: 0.35, fontWeight: 600, fontSize: 12.5 }}>not played</span>
+                : <>
+                    {rec.w > 0 && <span style={{ color: S.accent }}>{rec.w}W</span>}
+                    {rec.d > 0 && <span style={{ color: "#9fb0d0" }}>{rec.d}T</span>}
+                    {rec.l > 0 && <span style={{ color: "#ff8095" }}>{rec.l}L</span>}
+                  </>}
             </div>
           </div>
         );
@@ -2771,9 +3333,21 @@ function PlayerRoster({ g, myTeams }) {
 }
 
 function PlayerRivals({ g, meId }) {
-  const results = g.results || {};
+  const results = { ...(g.results || {}), ...RESULTS.get() };
   const allGames = [...groupStageFixtures(), ...(g.koGames || [])];
-  const teamWins = (team) => allGames.filter((gm) => results[gm.id] === team).length;
+  const teamWins = (team) => allGames.filter((gm) => winnerOf(results[gm.id]) === team).length;
+  // full W/D/L record for a team across all decided games
+  const teamRecord = (team) => {
+    let w = 0, d = 0, l = 0;
+    for (const gm of allGames) {
+      if (gm.home !== team && gm.away !== team) continue;
+      const res = results[gm.id]; if (!res) continue;
+      if (isDraw(res)) { d++; continue; }
+      const win = winnerOf(res); if (!win) continue;
+      if (win === team) w++; else l++;
+    }
+    return { w, d, l };
+  };
 
   const rows = g.players.map((p) => {
     const teams = g.picks.filter((x) => x.playerId === p.id).map((x) => x.team);
@@ -2828,11 +3402,17 @@ function PlayerRivals({ g, meId }) {
                           overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {team}
                         </span>
-                        {teamWins(team) > 0 && (
-                          <span style={{ fontSize: 11, fontWeight: 700, color: S.accent }}>
-                            {teamWins(team)}W
-                          </span>
-                        )}
+                        {(() => {
+                          const rec = teamRecord(team);
+                          return (
+                            <span style={{ display: "inline-flex", gap: 4, flexShrink: 0,
+                              fontSize: 11, fontWeight: 700 }}>
+                              {rec.w > 0 && <span style={{ color: S.accent }}>{rec.w}W</span>}
+                              {rec.d > 0 && <span style={{ color: "#9fb0d0" }}>{rec.d}T</span>}
+                              {rec.l > 0 && <span style={{ color: "#ff8095" }}>{rec.l}L</span>}
+                            </span>
+                          );
+                        })()}
                       </div>
                     ))}
                   </div>
@@ -2846,72 +3426,292 @@ function PlayerRivals({ g, meId }) {
   );
 }
 
-// The single soonest undecided game across the whole tournament (any teams).
-// GROUP_FIXTURES is already in chronological order, so we keep that order and
-// just drop decided games; knockout games (added later) come after.
+// The single soonest undecided game across the whole tournament (any teams),
+// ordered by actual kickoff time.
 function nextUpcomingGame(g) {
-  const results = g.results || {};
+  const results = { ...(g.results || {}), ...RESULTS.get() };
   const games = [...groupStageFixtures(), ...(g.koGames || [])]
-    .filter((gm) => !results[gm.id]);
+    .filter((gm) => !results[gm.id])
+    .sort((a, b) => gameSortKey(a) - gameSortKey(b));
   return games[0] || null;
 }
 
-/* Legends page: who holds each label, and its point effect. */
-function LegendsPage({ g, meId, pname }) {
+/* Awards & Shame page: who holds each label, split by positive/zero vs negative. */
+/* A single player's page: roster, fames/shames/legends, biggest win & loss. */
+function PlayerPage({ g, playerId, meId, ownerOf, pname, onOpenAwards }) {
+  const [showBreakdown, setShowBreakdown] = useState(false);
   const rows = useMemo(() => computeStandings(g), [g]);
-  const holders = {};
-  LEGENDS.forEach((l) => { holders[l.key] = []; });
-  rows.forEach((r) => {
-    (r.legends || []).forEach((l) => { holders[l.key].push({ name: r.name, id: r.id }); });
-  });
+  const row = rows.find((r) => r.id === playerId);
+  const myTeams = g.picks.filter((x) => x.playerId === playerId).map((x) => x.team);
+  const teamSet = new Set(myTeams);
+  const results = { ...(g.results || {}), ...RESULTS.get() };
+  const allGames = [...groupStageFixtures(), ...(g.koGames || [])];
+
+  // Biggest win / loss: largest goal margin in any match involving one of this
+  // player's teams, regardless of who owns the opponent.
+  let bigWin = null, bigLoss = null; // { team, opp, gf, ga, margin, stage }
+  for (const gm of allGames) {
+    const res = results[gm.id];
+    if (!res || typeof res !== "object" || res.h == null || res.a == null) continue;
+    for (const side of ["home", "away"]) {
+      const team = gm[side];
+      if (!teamSet.has(team)) continue;
+      const gf = side === "home" ? res.h : res.a;
+      const ga = side === "home" ? res.a : res.h;
+      const opp = side === "home" ? gm.away : gm.home;
+      const margin = gf - ga;
+      const entry = { team, opp, gf, ga, margin, stage: gm.stage };
+      if (margin > 0 && (!bigWin || margin > bigWin.margin)) bigWin = entry;
+      if (margin < 0 && (!bigLoss || margin < bigLoss.margin)) bigLoss = entry;
+    }
+  }
+
+  // Next game: soonest undecided fixture involving one of this player's teams.
+  const upcoming = allGames
+    .filter((gm) => (teamSet.has(gm.home) || teamSet.has(gm.away)) && !results[gm.id])
+    .sort((a, b) => gameSortKey(a) - gameSortKey(b));
+  const nextGame = upcoming[0] || null;
+
+  const isMe = playerId === meId;
+  const awards = row?.legends || [];
+  const fames = awards.filter((a) => a.kind === "fame");
+  const shames = awards.filter((a) => a.kind === "shame");
+  const legends = awards.filter((a) => a.kind === "legend");
+
+  const MatchCard = ({ title, m, positive }) => (
+    <div style={{ ...card, padding: "12px 14px", marginBottom: 8,
+      borderColor: positive ? "rgba(61,220,151,0.4)" : "rgba(255,128,149,0.4)" }}>
+      <div style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase",
+        letterSpacing: "0.08em", opacity: 0.6, marginBottom: 8,
+        color: positive ? S.winB : "#ff8095" }}>{title}</div>
+      {!m ? (
+        <div style={{ opacity: 0.45, fontSize: 13 }}>None yet</div>
+      ) : (
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 18 }}>{FLAG[m.team]}</span>
+          <span style={{ fontWeight: 800, fontSize: 14 }}>{m.team}</span>
+          <span style={{ fontWeight: 800, fontSize: 16, fontVariantNumeric: "tabular-nums",
+            margin: "0 4px" }}>{m.gf}–{m.ga}</span>
+          <span style={{ fontWeight: 600, fontSize: 14, opacity: 0.85 }}>{m.opp}</span>
+          <span style={{ fontSize: 18 }}>{FLAG[m.opp]}</span>
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <>
-      <p style={{ fontSize: 13, opacity: 0.6, margin: "0 0 14px", lineHeight: 1.5 }}>
-        Labels are awarded by performance and change the score. If players tie for one,
-        nobody gets it.
-      </p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {LEGENDS.map((l) => {
-          const who = holders[l.key];
-          const mine = who.some((w) => w.id === meId);
-          const sign = l.value > 0 ? `+${l.value}` : `${l.value}`;
-          return (
-            <div key={l.key} style={{ ...card, padding: "12px 14px",
-              borderColor: mine ? S.accent : "#222d47" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <span style={{ fontSize: 22 }}>{l.emoji}</span>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 800, fontSize: 15 }}>{l.label}</div>
-                  <div style={{ fontSize: 12, opacity: 0.6, marginTop: 1 }}>{l.desc}</div>
-                </div>
-                <span style={{ fontWeight: 800, fontSize: 14,
-                  color: l.value > 0 ? S.winB : (l.value < 0 ? "#ff8095" : "#9fb0d0"),
-                  fontVariantNumeric: "tabular-nums" }}>
-                  {l.value === 0 ? "±0" : sign}
-                </span>
-              </div>
-              <div style={{ marginTop: 8, fontSize: 13 }}>
-                {who.length === 0
-                  ? <span style={{ opacity: 0.45 }}>Unclaimed{l.value !== 0 ? " (tie or nobody qualifies)" : ""}</span>
-                  : who.map((w, i) => (
-                      <span key={w.id} style={{ fontWeight: w.id === meId ? 800 : 600,
-                        color: w.id === meId ? S.accent : S.ink }}>
-                        {w.name}{i < who.length - 1 ? ", " : ""}
-                      </span>
-                    ))}
-              </div>
+      {/* Score summary — tap to see where points come from */}
+      <div style={{ ...card, marginBottom: 16, padding: 0, overflow: "hidden",
+        borderColor: isMe ? S.accent : "#222d47" }}>
+        <button onClick={() => setShowBreakdown((v) => !v)}
+          style={{ width: "100%", background: "transparent", border: "none",
+            cursor: "pointer", fontFamily: "inherit", color: "inherit",
+            padding: "14px 16px", display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={{ flex: 1, textAlign: "left" }}>
+            <div style={{ fontWeight: 800, fontSize: 18 }}>{row?.name}{isMe ? " (you)" : ""}</div>
+            <div style={{ fontSize: 12, opacity: 0.55, marginTop: 2 }}>
+              {row?.wins}W · {row?.draws}D · {row?.losses}L · {myTeams.length} teams
             </div>
-          );
-        })}
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontWeight: 800, fontSize: 26, fontVariantNumeric: "tabular-nums",
+              color: (row?.total ?? 0) < 0 ? "#ff8095" : S.ink }}>{row?.total ?? 0}</div>
+            <div style={{ fontSize: 10.5, opacity: 0.45 }}>
+              points · {showBreakdown ? "hide" : "tap for breakdown"}
+            </div>
+          </div>
+          <span style={{ opacity: 0.4, fontSize: 13,
+            transform: showBreakdown ? "rotate(90deg)" : "none", transition: "transform .15s" }}>▸</span>
+        </button>
+        {showBreakdown && (
+          <div style={{ padding: "0 16px 14px" }}>
+            {(() => {
+              const lines = [
+                ["Wins", row?.winPts ?? 0, `${row?.wins ?? 0} ${row?.wins === 1 ? "win" : "wins"}`],
+                ["Draws", row?.drawPts ?? 0, `${row?.draws ?? 0} ${row?.draws === 1 ? "draw" : "draws"}`],
+                ["Losses", row?.matchNeg ?? 0, `${row?.losses ?? 0} ${row?.losses === 1 ? "loss" : "losses"}`],
+                ["Progression", row?.progB ?? 0, "Bonuses as your teams advance"],
+                ["Rivalry", row?.rivalB ?? 0, "Head-to-head and schadenfreude vs your rival"],
+                ["Fames & Shames", row?.fameB ?? 0, "Badges you've earned (tap below for detail)"],
+              ];
+              return lines.map(([label, val, desc]) => (
+                <div key={label} style={{ display: "flex", alignItems: "center", gap: 10,
+                  padding: "8px 0", borderTop: "1px solid #222d47" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: 13.5 }}>{label}</div>
+                    <div style={{ fontSize: 11, opacity: 0.5, marginTop: 1 }}>{desc}</div>
+                  </div>
+                  <div style={{ fontWeight: 800, fontSize: 16, fontVariantNumeric: "tabular-nums",
+                    color: val > 0 ? S.accent : val < 0 ? "#ff8095" : "#9fb0d0" }}>
+                    {val > 0 ? "+" : ""}{val}
+                  </div>
+                </div>
+              ));
+            })()}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0 2px",
+              borderTop: "2px solid #2c3a5c", marginTop: 2 }}>
+              <div style={{ flex: 1, fontWeight: 800, fontSize: 14 }}>Total</div>
+              <div style={{ fontWeight: 800, fontSize: 18, fontVariantNumeric: "tabular-nums",
+                color: (row?.total ?? 0) < 0 ? "#ff8095" : S.ink }}>{row?.total ?? 0}</div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Next game */}
+      <div style={{ ...card, marginBottom: 8, padding: "12px 14px",
+        borderColor: nextGame ? S.accent : "#222d47" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: nextGame ? 8 : 0 }}>
+          <span style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase",
+            letterSpacing: "0.08em", color: S.accent }}>Next game</span>
+          {nextGame && <span style={{ fontSize: 11, opacity: 0.6, fontWeight: 600 }}>{fmtWhen(nextGame)}</span>}
+        </div>
+        {!nextGame ? (
+          <div style={{ opacity: 0.45, fontSize: 13 }}>No upcoming games for their teams.</div>
+        ) : (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 18 }}>{FLAG[nextGame.home]}</span>
+            <span style={{ fontWeight: teamSet.has(nextGame.home) ? 800 : 600, fontSize: 14,
+              color: teamSet.has(nextGame.home) ? S.accent : S.ink }}>{nextGame.home}</span>
+            <span style={{ opacity: 0.4, fontWeight: 700, margin: "0 2px" }}>vs</span>
+            <span style={{ flex: 1, fontWeight: teamSet.has(nextGame.away) ? 800 : 600, fontSize: 14,
+              color: teamSet.has(nextGame.away) ? S.accent : S.ink }}>{nextGame.away}</span>
+            <span style={{ fontSize: 18 }}>{FLAG[nextGame.away]}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Biggest win / loss */}
+      <MatchCard title="Biggest win" m={bigWin} positive />
+      <MatchCard title="Biggest loss" m={bigLoss} positive={false} />
+
+      {/* Fames / Shames / Legends — tap to open the full page */}
+      {awards.length > 0 && (
+        <button onClick={() => onOpenAwards && onOpenAwards()}
+          style={{ ...card, marginTop: 16, width: "100%", textAlign: "left",
+            cursor: onOpenAwards ? "pointer" : "default", fontFamily: "inherit", color: "inherit",
+            padding: "14px 16px" }}>
+          <div style={{ display: "flex", alignItems: "center", marginBottom: 8 }}>
+            <span style={{ ...lbl, flex: 1 }}>Fames & Shames</span>
+            {onOpenAwards && <span style={{ opacity: 0.4, fontSize: 13 }}>view all ›</span>}
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {[...fames, ...shames, ...legends].map((a) => (
+              <span key={a.key} style={{ display: "inline-flex", alignItems: "center", gap: 5,
+                fontSize: 12.5, fontWeight: 700, padding: "5px 10px", borderRadius: 999,
+                background: a.kind === "fame" ? "rgba(61,220,151,0.15)"
+                  : a.kind === "shame" ? "rgba(255,128,149,0.15)" : "rgba(159,176,208,0.15)",
+                color: a.kind === "fame" ? S.accent : a.kind === "shame" ? "#ff8095" : "#9fb0d0" }}>
+                <span>{a.emoji}</span>{a.label}
+              </span>
+            ))}
+          </div>
+        </button>
+      )}
+
+      {/* Roster */}
+      <div style={{ marginTop: 16 }}>
+        <div style={{ ...lbl, marginBottom: 8 }}>Roster</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+          {myTeams.map((team) => (
+            <div key={team} style={{ display: "flex", alignItems: "center", gap: 7,
+              background: S.card2, borderRadius: 9, padding: "8px 10px" }}>
+              <span style={{ fontSize: 15 }}>{FLAG[team]}</span>
+              <span style={{ flex: 1, fontSize: 12.5, fontWeight: 600,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{team}</span>
+            </div>
+          ))}
+        </div>
       </div>
     </>
   );
 }
 
+function LegendsPage({ g, meId, pname }) {
+  const rows = useMemo(() => computeStandings(g), [g]);
+  const holders = {};
+  AWARDS.forEach((a) => { holders[a.key] = []; });
+  rows.forEach((r) => {
+    (r.legends || []).forEach((a) => { holders[a.key].push({ name: r.name, id: r.id }); });
+  });
+
+  const renderAward = (a) => {
+    const who = holders[a.key];
+    const mine = who.some((w) => w.id === meId);
+    // split value actually applied to each holder
+    const n = a.split && who.length > 0 ? who.length : 1;
+    const each = a.value / n;
+    const sign = each > 0 ? `+${round1(each)}` : `${round1(each)}`;
+    const splitNote = a.split && who.length > 1 ? ` (split ${who.length} ways)` : "";
+    return (
+      <div key={a.key} style={{ ...card, padding: "12px 14px",
+        borderColor: mine ? S.accent : "#222d47" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 22 }}>{a.emoji}</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 800, fontSize: 15 }}>{a.label}</div>
+            <div style={{ fontSize: 12, opacity: 0.6, marginTop: 1 }}>{a.desc}</div>
+          </div>
+          <span style={{ fontWeight: 800, fontSize: 14,
+            color: a.value > 0 ? S.winB : (a.value < 0 ? "#ff8095" : "#9fb0d0"),
+            fontVariantNumeric: "tabular-nums" }}>
+            {a.value === 0 ? "badge" : (who.length > 0 ? sign : (a.value > 0 ? `+${a.value}` : `${a.value}`))}
+          </span>
+        </div>
+        <div style={{ marginTop: 8, fontSize: 13 }}>
+          {who.length === 0
+            ? <span style={{ opacity: 0.45 }}>Unclaimed</span>
+            : <>
+                {who.map((w, i) => (
+                  <span key={w.id} style={{ fontWeight: w.id === meId ? 800 : 600,
+                    color: w.id === meId ? S.accent : S.ink }}>
+                    {w.name}{i < who.length - 1 ? ", " : ""}
+                  </span>
+                ))}
+                <span style={{ opacity: 0.45 }}>{splitNote}</span>
+              </>}
+        </div>
+      </div>
+    );
+  };
+
+  // Only show awards that can currently fire (ready). Group by kind.
+  const live = AWARDS.filter((a) => a.ready);
+  const fames = live.filter((a) => a.kind === "fame");
+  const shames = live.filter((a) => a.kind === "shame");
+  const legends = live.filter((a) => a.kind === "legend");
+
+  const Section = ({ emoji, title, color, items }) => (
+    <>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 0 10px" }}>
+        <span style={{ fontSize: 18 }}>{emoji}</span>
+        <span style={{ font: "800 17px 'Space Grotesk', sans-serif", color }}>{title}</span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 22 }}>
+        {items.map(renderAward)}
+      </div>
+    </>
+  );
+
+  return (
+    <>
+      <p style={{ fontSize: 13, opacity: 0.6, margin: "0 0 16px", lineHeight: 1.5 }}>
+        Fames add points, Shames take them away, and Legends are just for glory.
+        When several players earn the same one, its value splits evenly among them.
+      </p>
+      <Section emoji="🏆" title="Fames" color={S.winB} items={fames} />
+      <Section emoji="💩" title="Shames" color="#ff8095" items={shames} />
+      <Section emoji="🌟" title="Legends" color="#9fb0d0" items={legends} />
+    </>
+  );
+}
+function round1(n) { return Math.round(n * 10) / 10; }
+
 /* Rivalries page: each player vs their rival, with head-to-head match record. */
 function RivalriesPage({ g, meId, ownerOf, pname }) {
   const rivals = g.rivals || {};
-  const results = g.results || {};
+  const results = { ...(g.results || {}), ...RESULTS.get() };
   const teamsOf = (pid) => g.picks.filter((x) => x.playerId === pid).map((x) => x.team);
   const allGames = [...groupStageFixtures(), ...(g.koGames || [])];
 
@@ -2919,9 +3719,11 @@ function RivalriesPage({ g, meId, ownerOf, pname }) {
     let pWins = 0, rWins = 0;
     for (const gm of allGames) {
       const res = results[gm.id];
-      if (!res || res === "DRAW") continue;
-      const loser = gm.home === res ? gm.away : gm.home;
-      const wOwn = ownerOf(res), lOwn = ownerOf(loser);
+      if (!res || isDraw(res)) continue;
+      const w = winnerOf(res);
+      if (!w) continue;
+      const loser = gm.home === w ? gm.away : gm.home;
+      const wOwn = ownerOf(w), lOwn = ownerOf(loser);
       if (wOwn === pid && lOwn === rid) pWins++;
       if (wOwn === rid && lOwn === pid) rWins++;
     }
@@ -2937,8 +3739,9 @@ function RivalriesPage({ g, meId, ownerOf, pname }) {
   return (
     <>
       <p style={{ fontSize: 13, opacity: 0.6, margin: "0 0 14px", lineHeight: 1.5 }}>
-        Each player picked a rival before the draft. Beating your rival's teams scores
-        +{RIVAL.beatYourRival} each time. Here's how everyone's doing.
+        Each player picked a rival before the draft. When your team beats your rival's
+        team head-to-head you score big (and lose points if they beat yours), plus
+        schadenfreude when your rival's teams lose in the knockouts. Here's the record.
       </p>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {withRival.map((p) => {
@@ -2977,56 +3780,102 @@ function RivalriesPage({ g, meId, ownerOf, pname }) {
 }
 
 function PlayerUpcoming({ g, myTeamSet, ownerOf, pname, meId }) {
-  const results = g.results || {};
-  // group-stage fixtures have dates; knockout games are dated by stage order if no date.
-  const games = [...groupStageFixtures(), ...(g.koGames || [])]
-    .filter((gm) => myTeamSet.has(gm.home) || myTeamSet.has(gm.away))
-    .filter((gm) => !results[gm.id]); // not yet decided
+  const [sub, setSub] = useState("upcoming"); // "played" | "upcoming"
+  const results = { ...(g.results || {}), ...RESULTS.get() };
+  const allMy = [...groupStageFixtures(), ...(g.koGames || [])]
+    .filter((gm) => myTeamSet.has(gm.home) || myTeamSet.has(gm.away));
+  const upcoming = allMy.filter((gm) => !results[gm.id])
+    .sort((a, b) => gameSortKey(a) - gameSortKey(b)); // soonest first
+  const played = allMy.filter((gm) => results[gm.id])
+    .sort((a, b) => gameSortKey(b) - gameSortKey(a)); // most recent first
 
-  // sort by date (undated knockout games sink to bottom)
-  games.sort((a, b) => (a.date || "9999").localeCompare(b.date || "9999"));
+  const stageLabel = (k) => STAGES.find((s) => s.key === k)?.label || k;
 
-  if (games.length === 0) return (
-    <div style={{ ...card, textAlign: "center" }}>
-      <div style={{ fontSize: 26 }}>🎉</div>
-      <p style={{ fontWeight: 700, marginTop: 6 }}>No games pending</p>
-      <p style={{ opacity: 0.55, fontSize: 13 }}>
-        Every game involving your teams has a result, or none are scheduled yet.
-      </p>
+  const SubTabs = () => (
+    <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+      {[["upcoming", `Upcoming${upcoming.length ? ` (${upcoming.length})` : ""}`],
+        ["played", `Played${played.length ? ` (${played.length})` : ""}`]].map(([k, label]) => (
+        <button key={k} onClick={() => setSub(k)}
+          style={{ flex: 1, padding: "9px 12px", borderRadius: 10, fontWeight: 700,
+            fontSize: 13.5, fontFamily: "inherit", cursor: "pointer",
+            border: `1px solid ${sub === k ? S.accent : "#222d47"}`,
+            background: sub === k ? S.card2 : "transparent",
+            color: sub === k ? S.accent : S.ink }}>{label}</button>
+      ))}
     </div>
   );
 
-  const stageLabel = (k) => STAGES.find((s) => s.key === k)?.label || k;
+  const playedCard = (gm) => {
+    const res = results[gm.id];
+    const w = winnerOf(res);
+    const drawn = isDraw(res);
+    const sc = scoreText(res);
+    const hMine = myTeamSet.has(gm.home), aMine = myTeamSet.has(gm.away);
+    return (
+      <div key={gm.id} style={{ ...card, padding: "10px 14px", marginBottom: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+          <span style={{ fontSize: 11, opacity: 0.5, fontWeight: 700,
+            textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            {stageLabel(gm.stage)}{gm.group ? ` · Group ${gm.group}` : ""}
+          </span>
+          <span style={{ fontSize: 11, opacity: 0.55 }}>{drawn ? "Draw" : `${w} win`}
+            {res && res.pen ? " (pens)" : ""}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 16 }}>{FLAG[gm.home]}</span>
+          <span style={{ flex: 1, fontWeight: hMine ? 800 : 600, fontSize: 14,
+            color: w === gm.home ? S.winB : S.ink }}>{gm.home}</span>
+          <span style={{ fontWeight: 800, fontSize: 18, fontVariantNumeric: "tabular-nums",
+            minWidth: 54, textAlign: "center" }}>{sc || (drawn ? "–" : "")}</span>
+          <span style={{ flex: 1, textAlign: "right", fontWeight: aMine ? 800 : 600, fontSize: 14,
+            color: w === gm.away ? S.winB : S.ink }}>{gm.away}</span>
+          <span style={{ fontSize: 16 }}>{FLAG[gm.away]}</span>
+        </div>
+      </div>
+    );
+  };
+
+  const upcomingCard = (gm, i) => {
+    const hMine = myTeamSet.has(gm.home), aMine = myTeamSet.has(gm.away);
+    const headToHead = ownerOf(gm.home) && ownerOf(gm.away)
+      && ownerOf(gm.home) !== ownerOf(gm.away) && (hMine || aMine);
+    const youOwnBoth = hMine && aMine;
+    return (
+      <div key={gm.id} style={{ ...card, padding: "12px 14px", marginBottom: 8,
+        borderColor: i === 0 ? S.accent : "#222d47" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+          <span style={{ fontSize: 11, opacity: 0.5, fontWeight: 700,
+            textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            {stageLabel(gm.stage)}{gm.group ? ` · Group ${gm.group}` : ""}
+          </span>
+          <span style={{ fontSize: 12, opacity: 0.7, fontWeight: 600 }}>{fmtWhen(gm)}</span>
+        </div>
+        <Side team={gm.home} mine={hMine} owner={ownerOf(gm.home)} pname={pname} />
+        <div style={{ textAlign: "center", fontSize: 11, opacity: 0.35, margin: "2px 0" }}>vs</div>
+        <Side team={gm.away} mine={aMine} owner={ownerOf(gm.away)} pname={pname} />
+        {youOwnBoth && <Tag text="you own both — no head-to-head" />}
+        {headToHead && !youOwnBoth && <Tag text={`head-to-head vs ${
+          pname(ownerOf(hMine ? gm.away : gm.home))}`} accent />}
+      </div>
+    );
+  };
+
+  const empty = (msg) => (
+    <div style={{ ...card, textAlign: "center", padding: "28px 16px" }}>
+      <div style={{ fontSize: 26 }}>⚽</div>
+      <p style={{ opacity: 0.55, fontSize: 13, marginTop: 8 }}>{msg}</p>
+    </div>
+  );
+
   return (
     <>
       <p style={{ fontSize: 13, opacity: 0.55, margin: "0 0 14px" }}>
-        Next games involving your teams. Bold side is yours.
+        Games involving your teams. Bold side is yours.
       </p>
-      {games.map((gm, i) => {
-        const hMine = myTeamSet.has(gm.home), aMine = myTeamSet.has(gm.away);
-        const headToHead = ownerOf(gm.home) && ownerOf(gm.away)
-          && ownerOf(gm.home) !== ownerOf(gm.away)
-          && (hMine || aMine);
-        const youOwnBoth = hMine && aMine;
-        return (
-          <div key={gm.id} style={{ ...card, padding: "12px 14px", marginBottom: 8,
-            borderColor: i === 0 ? S.accent : "#222d47" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ fontSize: 11, opacity: 0.5, fontWeight: 700,
-                textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                {stageLabel(gm.stage)}{gm.group ? ` · Group ${gm.group}` : ""}
-              </span>
-              <span style={{ fontSize: 12, opacity: 0.7, fontWeight: 600 }}>{fmtWhen(gm)}</span>
-            </div>
-            <Side team={gm.home} mine={hMine} owner={ownerOf(gm.home)} pname={pname} />
-            <div style={{ textAlign: "center", fontSize: 11, opacity: 0.35, margin: "2px 0" }}>vs</div>
-            <Side team={gm.away} mine={aMine} owner={ownerOf(gm.away)} pname={pname} />
-            {youOwnBoth && <Tag text="you own both — no head-to-head" />}
-            {headToHead && !youOwnBoth && <Tag text={`head-to-head vs ${
-              pname(ownerOf(hMine ? gm.away : gm.home))}`} accent />}
-          </div>
-        );
-      })}
+      <SubTabs />
+      {sub === "upcoming"
+        ? (upcoming.length ? upcoming.map(upcomingCard) : empty("No upcoming games for your teams."))
+        : (played.length ? played.map(playedCard) : empty("None of your teams have played yet."))}
     </>
   );
 }
