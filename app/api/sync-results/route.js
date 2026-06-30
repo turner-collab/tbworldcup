@@ -1,3 +1,5 @@
+// Jingo v3.2 — /api/sync-results: writes FINISHED games as results and captures
+// IN_PLAY/PAUSED games as display-only live scores (data.live). Self-throttles.
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase";
 import { FIXTURE_PAIRS, KICKOFFS } from "@/lib/fixturePairs";
@@ -139,10 +141,16 @@ export async function GET(request) {
     pairToId[`${normName(away)}|${normName(home)}`] = id;
   }
 
-  // 3. Convert finished provider matches into our {h,a,w} keyed by fixture id
+  // 3. Convert provider matches into our data. FINISHED games become real
+  //    results (incoming). IN_PLAY/PAUSED games become live snapshots (liveScores)
+  //    — display-only, never scored, cleared once the game finishes.
   const incoming = {};
+  const liveScores = {};
   for (const m of providerMatches) {
-    if (m.status !== "FINISHED") continue;
+    const status = m.status;
+    const isFinished = status === "FINISHED";
+    const isLive = status === "IN_PLAY" || status === "PAUSED";
+    if (!isFinished && !isLive) continue;
     const home = m.homeTeam && m.homeTeam.name;
     const away = m.awayTeam && m.awayTeam.name;
     if (!home || !away) continue;
@@ -157,54 +165,60 @@ export async function GET(request) {
       return [h, a];
     };
     const sc = m.score || {};
+
+    // Resolve OUR home/away orientation for this fixture.
+    const pair = FIXTURE_PAIRS.find((p) => p[0] === id);
+    const ourHome = pair[1], ourAway = pair[2];
+    const providerHomeIsOurHome = normName(home) === normName(ourHome);
+
+    // --- Live, in-progress game: snapshot the current score for display only ---
+    if (isLive) {
+      // current running score lives in fullTime for in-play matches
+      let [lh, la] = readScore(sc.fullTime);
+      if (lh == null) [lh, la] = readScore(sc.regularTime);
+      if (lh == null) { lh = 0; la = 0; }
+      const h = providerHomeIsOurHome ? lh : la;
+      const a = providerHomeIsOurHome ? la : lh;
+      liveScores[id] = { h, a, status: "live" };
+      continue;
+    }
+
+    // --- Finished game: compute the real result (as before) ---
     const isPens = sc.duration === "PENALTY_SHOOTOUT";
-    // For a shootout, football-data folds the shootout into fullTime (e.g. a 1-1
-    // game won 6-5 on pens shows fullTime 7-6). We want the real on-field score,
-    // so prefer regularTime, then extraTime, and only fall back to fullTime for
-    // normal games.
     let hg, ag;
     if (isPens) {
       [hg, ag] = readScore(sc.regularTime);
       if (hg == null) [hg, ag] = readScore(sc.extraTime);
-      if (hg == null) [hg, ag] = readScore(sc.fullTime); // last resort
+      if (hg == null) [hg, ag] = readScore(sc.fullTime);
     } else {
       [hg, ag] = readScore(sc.fullTime);
     }
     if (hg == null || ag == null) continue;
 
-    // Resolve to OUR canonical team names for this fixture (provider spellings
-    // like "Korea Republic" must become our "South Korea" so ownerOf() matches).
-    const pair = FIXTURE_PAIRS.find((p) => p[0] === id);
-    const ourHome = pair[1], ourAway = pair[2];
-    const providerHomeIsOurHome = normName(home) === normName(ourHome);
     const h = providerHomeIsOurHome ? hg : ag;
     const a = providerHomeIsOurHome ? ag : hg;
 
-    // Group-stage draw (knockouts never end drawn — they go to pens below).
     if ((sc.winner === "DRAW" || hg === ag) && !isPens) {
       incoming[id] = { h, a, w: "DRAW" };
       continue;
     }
-
-    // Decide winner side, then translate to our canonical name.
     let providerWinnerIsHome;
     if (sc.winner === "HOME_TEAM") providerWinnerIsHome = true;
     else if (sc.winner === "AWAY_TEAM") providerWinnerIsHome = false;
-    else providerWinnerIsHome = hg > ag; // fallback by on-field score
+    else providerWinnerIsHome = hg > ag;
     const ourWinner = (providerWinnerIsHome === providerHomeIsOurHome) ? ourHome : ourAway;
 
-    if (isPens) {
-      incoming[id] = { h, a, w: ourWinner, pen: true };
-    } else {
-      incoming[id] = { h, a, w: ourWinner };
-    }
+    if (isPens) incoming[id] = { h, a, w: ourWinner, pen: true };
+    else incoming[id] = { h, a, w: ourWinner };
   }
 
-  // 4. Read the current shared results row, fill ONLY blanks
+  // 4. Read the current shared results row, fill ONLY blanks for finished games,
+  //    and refresh the live snapshot (live is display-only and fully replaced).
   const sb = supabaseAdmin();
   const { data: row } = await sb.from("groups")
     .select("data").eq("id", RESULTS_ID).maybeSingle();
   const current = (row && row.data && row.data.results) ? row.data.results : {};
+  const prevLive = (row && row.data && row.data.live) ? row.data.live : {};
 
   let added = 0;
   const merged = { ...current };
@@ -215,9 +229,17 @@ export async function GET(request) {
     }
   }
 
-  if (added > 0) {
+  // Build the new live map: keep only games that are still live AND not yet
+  // final. Once a game has a real result, drop it from live so the UI shows FINAL.
+  const newLive = {};
+  for (const [id, val] of Object.entries(liveScores)) {
+    if (merged[id] == null) newLive[id] = val; // still no final result -> show live
+  }
+
+  const liveChanged = JSON.stringify(prevLive) !== JSON.stringify(newLive);
+  if (added > 0 || liveChanged) {
     const { error: writeErr } = await sb.from("groups")
-      .upsert({ id: RESULTS_ID, data: { id: RESULTS_ID, results: merged } });
+      .upsert({ id: RESULTS_ID, data: { id: RESULTS_ID, results: merged, live: newLive } });
     if (writeErr) {
       return NextResponse.json({ error: writeErr.message }, { status: 500 });
     }
@@ -226,6 +248,7 @@ export async function GET(request) {
   return NextResponse.json({
     ok: true,
     providerFinished: providerMatches.filter((m) => m.status === "FINISHED").length,
+    liveNow: Object.keys(newLive).length,
     matchedIncoming: Object.keys(incoming).length,
     newlyFilled: added,
   });
