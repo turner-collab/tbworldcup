@@ -1,5 +1,5 @@
 "use client";
-// Jingo v3.2 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
+// Jingo v3.3 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
 // summaries, round points) + Jingo home header w/ back button + link-preview ready.
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 
@@ -2318,22 +2318,30 @@ function computeStandings(g, resultsOverride) {
   }
 
   // ---- Channel 3b: schadenfreude (KNOCKOUTS ONLY) ----
-  // Each time your rival's team loses in a knockout, +base+step*depth, UNLESS
-  // you already got the H2H credit for that exact match (your team beat them).
+  // Consolation for the knocked-out: a player earns schadenfreude ONLY once ALL
+  // of their own teams are out of the tournament. After that, every time any of
+  // their rival's teams loses a knockout game, they get +base+step*depth. This is
+  // purely additive to the eliminated player — it never affects the rival who lost.
+  const teamsOfPlayer = (pid) => g.picks.filter((x) => x.playerId === pid).map((x) => x.team);
+  const isFullyOut = (pid) => {
+    const mine = teamsOfPlayer(pid);
+    if (mine.length === 0) return false;
+    return mine.every((t) => teamEliminationStage(t, sharedResults) !== null);
+  };
+  const fullyOut = {};
+  g.players.forEach((p) => { fullyOut[p.id] = isFullyOut(p.id); });
+
   for (const game of ko) {
     const res = sharedResults[game.id];
     if (!res) continue;
     const w = winnerOf(res); if (!w) continue;
     const loser = game.home === w ? game.away : game.home;
-    const wOwn = ownerOf(w), lOwn = ownerOf(loser);
+    const lOwn = ownerOf(loser);
     const depth = D[game.stage] ?? 0;
-    if (!lOwn) continue; // rival's team must be owned to be someone's rival
-    // who has lOwn as their rival? each such player gets schadenfreude...
+    if (!lOwn) continue; // the losing team must be owned to be someone's rival
     g.players.forEach((p) => {
-      if (rivals[p.id] !== lOwn) return;           // p's rival owns the loser
-      // ...unless p is the winner's owner AND already got H2H for this match
-      const gotH2H = (p.id === wOwn) && isMyRival(wOwn, lOwn);
-      if (gotH2H) return;
+      if (rivals[p.id] !== lOwn) return;   // p's rival owns the loser
+      if (!fullyOut[p.id]) return;         // p must have no teams left alive
       rivalB[p.id] += RV.schadenBase + RV.schadenStep * depth;
     });
   }
@@ -2452,12 +2460,15 @@ function roundPoints(g, stage) {
       if (loserPickedWinner) rival[lOwn] += RV.h2hLossBase + RV.h2hLossStep * depth;
       if (loserPickedWinner && !winnerPickedLoser) rival[wOwn] += RV.haterBonus;
     }
-    // schadenfreude only applies to knockout rounds
+    // schadenfreude only applies to knockout rounds, and only pays a player who
+    // is themselves fully out of the tournament (see computeStandings for rule).
     if (stage !== "group" && lOwn) {
       g.players.forEach((p) => {
         if (rivals[p.id] !== lOwn) return;
-        const gotH2H = (p.id === wOwn) && isMyRival(wOwn, lOwn);
-        if (gotH2H) return;
+        const mine = g.picks.filter((x) => x.playerId === p.id).map((x) => x.team);
+        const fullyOut = mine.length > 0 &&
+          mine.every((t) => teamEliminationStage(t, results) !== null);
+        if (!fullyOut) return;
         rival[p.id] += RV.schadenBase + RV.schadenStep * depth;
       });
     }
@@ -3404,9 +3415,15 @@ function gamePointDeltas(g, gameId) {
   const without = { ...merged }; delete without[gameId];
   const withoutMap = computeStandings(g, without);
   const out = {};
+  // Only show the channels a player can attribute to THIS game: match (win/loss)
+  // points and rivalry. Progression and fames/shames are excluded because they
+  // shift indirectly (e.g. award re-splits) and make the per-game number look
+  // confusing. Season totals still include everything.
   withMap.forEach((r) => {
     const before = withoutMap.find((b) => b.id === r.id);
-    out[r.id] = { name: r.name, delta: Math.round((r.total - (before ? before.total : 0)) * 10) / 10 };
+    const dMatch = r.matchB - (before ? before.matchB : 0);
+    const dRival = r.rivalB - (before ? before.rivalB : 0);
+    out[r.id] = { name: r.name, delta: Math.round((dMatch + dRival) * 10) / 10 };
   });
   return out;
 }
