@@ -1,4 +1,6 @@
 "use client";
+// Jingo v3.2 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
+// summaries, round points) + Jingo home header w/ back button + link-preview ready.
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 
 /* ============================================================================
@@ -212,6 +214,7 @@ const _resultSubs = new Set();
 const RESULTS_ID = "__results__";
 const RESULTS_KEY = groupKey(RESULTS_ID);
 let _resultsCache = null;
+let _liveCache = {};
 
 const RESULTS = {
   async load() {
@@ -219,6 +222,8 @@ const RESULTS = {
     // the row may be wrapped as a "group" object; accept either shape
     const map = data && data.results ? data.results : (data && !data.id ? data : {});
     _resultsCache = map || {};
+    // in-progress (live) scores ride alongside results in the same row
+    _liveCache = (data && data.live) ? data.live : {};
     return _resultsCache;
   },
   get() { return _resultsCache || {}; },
@@ -227,12 +232,23 @@ const RESULTS = {
     if (value == null) delete cur[matchId];
     else cur[matchId] = value;
     _resultsCache = cur;
-    // store under a wrapper object so the row is a valid "group"-shaped record
-    await STORAGE.set(RESULTS_KEY, { id: RESULTS_ID, results: cur });
+    // preserve the live snapshot so a manual score entry doesn't wipe it
+    await STORAGE.set(RESULTS_KEY, { id: RESULTS_ID, results: cur, live: _liveCache });
     _resultSubs.forEach((fn) => fn(cur));
     return cur;
   },
   subscribe(fn) { _resultSubs.add(fn); return () => _resultSubs.delete(fn); },
+};
+
+// In-progress (live) scores — display only, never scored. Refreshed from the
+// feed via RESULTS.load() (which reads the row's `live` field).
+const LIVE = {
+  get() { return _liveCache || {}; },
+  getOne(id) { return (_liveCache || {})[id] || null; },
+  set(map) {
+    _liveCache = map || {};
+    _resultSubs.forEach((fn) => fn(_resultsCache || {}));
+  },
 };
 
 
@@ -3306,7 +3322,7 @@ function PlayerView({ id, phone, playerId, onBack }) {
   // PHASE 4: draft done -> dashboard. Standings is home.
   return (
     <>
-      <Header title="Jingo"
+      <Header title="Jingo" onBack={onBack}
         sub={<span style={{ display: "block" }}>
           <span style={{ display: "block", fontWeight: 600, opacity: 0.85 }}>World Cup 2026</span>
           <span style={{ display: "block", marginTop: 2 }}>Playing as {me?.name}</span>
@@ -3396,8 +3412,17 @@ function gamePointDeltas(g, gameId) {
 }
 
 function StandingsHome({ g, meId, ownerOf, pname, onOpen, onOpenPlayer }) {
+  const liveActive = useMemo(() => {
+    const all = [...groupStageFixtures(), ...(g.koGames || [])];
+    const m = { ...(g.results || {}), ...RESULTS.get() };
+    return all.some((gm) => isGameLive(gm, m));
+  }, [g]);
+  const sharedResults = useSharedResults(liveActive);
   const allGames = useMemo(() => [...groupStageFixtures(), ...(g.koGames || [])], [g]);
-  const merged = useMemo(() => ({ ...(g.results || {}), ...RESULTS.get() }), [g]);
+  const merged = useMemo(
+    () => ({ ...(g.results || {}), ...RESULTS.get(), ...sharedResults }),
+    [g, sharedResults]
+  );
   const slate = useMemo(() => todaysSlate(allGames), [allGames]);
   const nav = [
     ["roster", "My Roster", "📋"], ["upcoming", "Games", "📅"],
@@ -3478,12 +3503,15 @@ function StandingsHome({ g, meId, ownerOf, pname, onOpen, onOpenPlayer }) {
 function SlateGame({ g, gm, results, ownerOf, pname, meId }) {
   const [open, setOpen] = useState(false);
   const res = results[gm.id];
-  const live = isGameLive(gm, results);
   const final = !!res;
+  const liveScore = !final ? LIVE.getOne(gm.id) : null; // {h,a,status:"live"}
+  const live = !final && (isGameLive(gm, results) || !!liveScore);
   const hOwn = ownerOf(gm.home), aOwn = ownerOf(gm.away);
   const mine = hOwn === meId || aOwn === meId;
   const w = final ? winnerOf(res) : null;
   const drawn = final ? isDraw(res) : false;
+  // score to display: final result, or live snapshot if mid-game
+  const showScore = final ? { h: res.h, a: res.a } : (liveScore ? { h: liveScore.h, a: liveScore.a } : null);
 
   const deltas = useMemo(
     () => (final ? gamePointDeltas(g, gm.id) : null),
@@ -3524,9 +3552,10 @@ function SlateGame({ g, gm, results, ownerOf, pname, meId }) {
           color: sideColor(gm.home) }}>{gm.home}
           {hOwn && <span style={{ fontSize: 12.5, fontWeight: 700, color: S.accent }}> · {pname(hOwn)}</span>}
         </span>
-        {final
-          ? <span style={{ fontWeight: 800, fontSize: 17, fontVariantNumeric: "tabular-nums" }}>
-              {res.h}–{res.a}</span>
+        {showScore
+          ? <span style={{ fontWeight: 800, fontSize: 17, fontVariantNumeric: "tabular-nums",
+              color: live ? "#e5484d" : S.ink }}>
+              {showScore.h}–{showScore.a}</span>
           : <span style={{ opacity: 0.3, fontWeight: 700 }}>vs</span>}
         <span style={{ flex: 1, textAlign: "right", fontWeight: aOwn === meId ? 800 : 600, fontSize: 14,
           color: sideColor(gm.away) }}>
