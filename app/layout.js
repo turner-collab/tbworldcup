@@ -1,6 +1,16 @@
 export const metadata = {
-  title: "Jingoism",
-  description: "Rabid Support For Every Nation — 2026 World Cup draft.",
+  title: "Jingo",
+  description: "Rabid support for every nation.",
+  openGraph: {
+    title: "Jingo",
+    description: "Rabid support for every nation.",
+    images: ["/jingo-logo.png"],
+  },
+  twitter: {
+    card: "summary",
+    title: "Jingo",
+    images: ["/jingo-logo.png"],
+  },
 };
 
 export default function RootLayout({ children }) {
