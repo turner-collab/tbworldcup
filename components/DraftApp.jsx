@@ -669,9 +669,12 @@ function AdminAllScores({ onBack }) {
   const [stageFilter, setStageFilter] = useState("group");
 
   const groupFix = useMemo(groupStageFixtures, []);
+  const knownKo = knockoutFixtures(stageFilter);
   const allGames = stageFilter === "group"
     ? groupFix
-    : koGames.filter((k) => k.stage === stageFilter);
+    : knownKo.length > 0
+      ? knownKo // known bracket (R32) — list directly, like the group stage
+      : koGames.filter((k) => k.stage === stageFilter); // R16+ still manually added
 
   // knockout adder
   const [koHome, setKoHome] = useState("");
@@ -724,7 +727,7 @@ function AdminAllScores({ onBack }) {
         ))}
       </div>
 
-      {stageFilter !== "group" && (
+      {stageFilter !== "group" && knownKo.length === 0 && (
         <div style={{ ...card, marginBottom: 14, padding: "12px 14px" }}>
           <div style={{ ...lbl, marginBottom: 8 }}>Add a {stageLabelG(stageFilter)} match</div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -746,7 +749,8 @@ function AdminAllScores({ onBack }) {
       {allGames.length === 0 ? (
         <div style={{ ...card, textAlign: "center", padding: "28px 16px" }}>
           <p style={{ opacity: 0.6, margin: 0 }}>
-            {stageFilter === "group" ? "No fixtures." : `No ${stageLabelG(stageFilter)} matches added yet.`}
+            {stageFilter === "group" ? "No fixtures."
+              : `${stageLabelG(stageFilter)} matchups aren't set yet — they depend on earlier results.`}
           </p>
         </div>
       ) : allGames.map((game) => (
@@ -979,7 +983,7 @@ function Header({ title, sub, onBack, right }) {
       <div style={{ flex: 1 }}>
         <h1 style={{ font: "800 26px/1.05 'Space Grotesk', sans-serif",
           letterSpacing: "-0.02em", margin: 0 }}>{title}</h1>
-        {sub && <p style={{ margin: "6px 0 0", opacity: 0.55, fontSize: 14 }}>{sub}</p>}
+        {sub && <div style={{ margin: "6px 0 0", opacity: 0.55, fontSize: 14 }}>{sub}</div>}
       </div>
       {right}
     </header>
@@ -1850,6 +1854,94 @@ function groupStageFixtures() {
     day: f.day, time: f.t,
   }));
 }
+
+// Known knockout fixtures for a stage (currently only R32 is pre-filled; R16+
+// matchups depend on results, so they fall back to whatever's in koGames).
+function knockoutFixtures(stage) {
+  if (stage === "r32") return R32_FIXTURES.map((f) => ({ ...f, stage: "r32" }));
+  return [];
+}
+
+// Bracket tree: how knockout games feed forward (official 2026 layout).
+const BRACKET = {
+  r16: [
+    { id: "r16-1", feeds: ["r32-3", "r32-6"] },
+    { id: "r16-2", feeds: ["r32-1", "r32-4"] },
+    { id: "r16-3", feeds: ["r32-12", "r32-11"] },
+    { id: "r16-4", feeds: ["r32-10", "r32-9"] },
+    { id: "r16-5", feeds: ["r32-2", "r32-5"] },
+    { id: "r16-6", feeds: ["r32-7", "r32-8"] },
+    { id: "r16-7", feeds: ["r32-15", "r32-14"] },
+    { id: "r16-8", feeds: ["r32-13", "r32-16"] },
+  ],
+  qf: [
+    { id: "qf-1", feeds: ["r16-1", "r16-2"] },
+    { id: "qf-2", feeds: ["r16-3", "r16-4"] },
+    { id: "qf-3", feeds: ["r16-5", "r16-6"] },
+    { id: "qf-4", feeds: ["r16-7", "r16-8"] },
+  ],
+  sf: [
+    { id: "sf-1", feeds: ["qf-1", "qf-2"] },
+    { id: "sf-2", feeds: ["qf-3", "qf-4"] },
+  ],
+  final: [{ id: "final-1", feeds: ["sf-1", "sf-2"] }],
+};
+// Group finishing position: 1=won group, 2=runner-up, 3=3rd advanced, 0=out.
+const GROUP_OUTCOME = {
+  Mexico: 1, "South Africa": 2, "South Korea": 0, Czechia: 0,
+  Switzerland: 1, Canada: 2, "Bosnia and Herzegovina": 3, Qatar: 0,
+  Brazil: 1, Morocco: 2, Scotland: 0, Haiti: 0,
+  "United States": 1, Australia: 2, Paraguay: 3, "Türkiye": 0,
+  Germany: 1, "Ivory Coast": 2, Ecuador: 3, "Curaçao": 0,
+  Netherlands: 1, Japan: 2, Sweden: 3, Tunisia: 0,
+  Belgium: 1, Egypt: 2, Iran: 0, "New Zealand": 0,
+  Spain: 1, "Cape Verde": 2, Uruguay: 0, "Saudi Arabia": 0,
+  France: 1, Norway: 2, Senegal: 3, Iraq: 0,
+  Argentina: 1, Austria: 2, Algeria: 3, Jordan: 0,
+  Colombia: 1, Portugal: 2, "DR Congo": 3, Uzbekistan: 0,
+  England: 1, Croatia: 2, Ghana: 3, Panama: 0,
+};
+
+// Where a team was eliminated, or null if still alive (or not yet decided).
+// Walks: group stage (GROUP_OUTCOME 0 = out), then each knockout round — if the
+// team played a knockout game and lost, that's their exit stage.
+// Returns a short label: "Groups", "R32", "R16", "QF", "SF", "Final".
+const KO_ROUND_OF = { r32: "R32", r16: "R16", qf: "QF", sf: "SF", final: "Final" };
+function teamEliminationStage(team, results) {
+  if (GROUP_OUTCOME[team] === 0) return "Groups"; // eliminated in groups
+  if (GROUP_OUTCOME[team] === undefined) return null; // unknown team
+  // Build the knockout node list with resolved participants.
+  const r32by = Object.fromEntries(R32_FIXTURES.map((f) => [f.id, f]));
+  const nodeIndex = {};
+  [...BRACKET.r16, ...BRACKET.qf, ...BRACKET.sf, ...BRACKET.final]
+    .forEach((n) => { nodeIndex[n.id] = n; });
+  const winOf = (id) => {
+    const res = results[id];
+    return res ? winnerOf(res) : null;
+  };
+  const teamsAt = (id) => {
+    if (r32by[id]) return [r32by[id].home, r32by[id].away];
+    const node = nodeIndex[id];
+    if (!node) return [null, null];
+    return node.feeds.map((c) => winOf(c));
+  };
+  // Check each knockout game; if this team played and lost, return that round.
+  const order = ["r32", "r16", "qf", "sf", "final"];
+  const nodesByStage = {
+    r32: Object.keys(r32by), r16: BRACKET.r16.map((n) => n.id),
+    qf: BRACKET.qf.map((n) => n.id), sf: BRACKET.sf.map((n) => n.id),
+    final: BRACKET.final.map((n) => n.id),
+  };
+  for (const stage of order) {
+    for (const id of nodesByStage[stage]) {
+      const [a, b] = teamsAt(id);
+      if (a !== team && b !== team) continue;
+      const w = winOf(id);
+      if (w && w !== team) return KO_ROUND_OF[stage]; // lost here
+    }
+  }
+  return null; // still alive or their next game isn't decided
+}
 function MatchupsTab({ g, save, patch }) {
   const ownerOf = useCallback(
     (team) => g.picks.find((p) => p.team === team)?.playerId, [g.picks]);
@@ -2296,8 +2388,93 @@ function computeStandings(g, resultsOverride) {
   }).sort((a, b) => b.total - a.total);
 }
 
-// Compute which awards each player earns. Returns { playerId: [awardObj,...] }.
-// Multiple players can hold the same award (split handled later in the engine).
+// Points each player earned IN A SPECIFIC ROUND: match points from that round's
+// games + rivalry earned in those games + the progression bonus tied to that
+// round. For "group" the progression piece is the out-of-group (+8 per team that
+// reached the R32). For a knockout stage it's that round's win bonus (e.g. +12
+// for winning an R32 game). Rivalry here is the round's raw contribution (the
+// global ±70 cap is applied to the season total, not per round).
+function roundPoints(g, stage) {
+  const ownerOf = (team) => g.picks.find((p) => p.team === team)?.playerId;
+  const rivals = g.rivals || {};
+  const isMyRival = (me, other) => rivals[me] === other;
+  const results = { ...(g.results || {}), ...RESULTS.get() };
+  const M = SCORING.mult, D = SCORING.depth, MP = SCORING.match, PR = SCORING.prog, RV = SCORING.rivalry;
+
+  const pts = {}, match = {}, rival = {}, prog = {};
+  const wins = {}, losses = {}, draws = {};
+  g.players.forEach((p) => {
+    pts[p.id] = match[p.id] = rival[p.id] = prog[p.id] = 0;
+    wins[p.id] = losses[p.id] = draws[p.id] = 0;
+  });
+
+  const ko = g.koGames || [];
+  const games = stage === "group"
+    ? groupStageFixtures()
+    : ko.filter((k) => k.stage === stage);
+  const mult = M[stage] ?? 1, depth = D[stage] ?? 0;
+
+  for (const game of games) {
+    const res = results[game.id];
+    if (!res) continue;
+    const hOwn = ownerOf(game.home), aOwn = ownerOf(game.away);
+    if (isDraw(res)) {
+      if (hOwn) { match[hOwn] += MP.tie * mult; draws[hOwn]++; }
+      if (aOwn) { match[aOwn] += MP.tie * mult; draws[aOwn]++; }
+      continue;
+    }
+    const w = winnerOf(res); if (!w) continue;
+    const loser = game.home === w ? game.away : game.home;
+    const wOwn = ownerOf(w), lOwn = ownerOf(loser);
+    if (wOwn) { match[wOwn] += MP.win * mult; wins[wOwn]++; }
+    if (lOwn) { match[lOwn] += MP.loss * mult; losses[lOwn]++; }
+    // head-to-head rivalry for this game
+    if (wOwn && lOwn && wOwn !== lOwn) {
+      const winnerPickedLoser = isMyRival(wOwn, lOwn);
+      const loserPickedWinner = isMyRival(lOwn, wOwn);
+      if (winnerPickedLoser) rival[wOwn] += RV.h2hWinBase + RV.h2hWinStep * depth;
+      if (loserPickedWinner) rival[lOwn] += RV.h2hLossBase + RV.h2hLossStep * depth;
+      if (loserPickedWinner && !winnerPickedLoser) rival[wOwn] += RV.haterBonus;
+    }
+    // schadenfreude only applies to knockout rounds
+    if (stage !== "group" && lOwn) {
+      g.players.forEach((p) => {
+        if (rivals[p.id] !== lOwn) return;
+        const gotH2H = (p.id === wOwn) && isMyRival(wOwn, lOwn);
+        if (gotH2H) return;
+        rival[p.id] += RV.schadenBase + RV.schadenStep * depth;
+      });
+    }
+  }
+
+  // progression tied to this round
+  if (stage === "group") {
+    // +8 for each owned team that reached the R32 (appears in koGames r32 set)
+    const r32Teams = new Set();
+    ko.filter((k) => k.stage === "r32").forEach((k) => { r32Teams.add(k.home); r32Teams.add(k.away); });
+    r32Teams.forEach((t) => { const o = ownerOf(t); if (o) prog[o] += PR.outOfGroup; });
+  } else {
+    const bonusKey = { r32: PR.winR32, r16: PR.winR16, qf: PR.winQF, sf: PR.reachFinal, final: PR.winFinal };
+    for (const game of games) {
+      const res = results[game.id]; if (!res) continue;
+      const w = winnerOf(res); if (!w) continue;
+      const o = ownerOf(w); if (!o) continue;
+      prog[o] += bonusKey[stage] || 0;
+    }
+  }
+
+  const out = {};
+  g.players.forEach((p) => {
+    out[p.id] = {
+      total: Math.round((match[p.id] + rival[p.id] + prog[p.id]) * 10) / 10,
+      match: Math.round(match[p.id] * 10) / 10,
+      prog: prog[p.id],
+      rival: Math.round(rival[p.id] * 10) / 10,
+      wins: wins[p.id], losses: losses[p.id], draws: draws[p.id],
+    };
+  });
+  return out;
+}
 // Only awards flagged ready:true can fire; the rest await unbuilt data.
 function computeLegends(g, ctx) {
   const { losses, draws, dt, teamsOf, rivals, fastestId, slowestId, lateId,
@@ -2867,11 +3044,11 @@ function RivalPickScreen({ g, me, onSet, pname, onBack }) {
           Choose your rival 🎯
         </h2>
         <p style={{ fontSize: 13.5, lineHeight: 1.55, opacity: 0.82, margin: 0 }}>
-          Your rival is the person you most want to beat. Every time one of your teams
-          beats one of theirs, you score <strong style={{ color: S.accent }}>+{RIVAL.beatYourRival}</strong>.
-          And any time you beat a team owned by someone who picked <em>you</em> as their
-          rival, you get <strong style={{ color: S.accent }}>+{RIVAL.beatYourHater}</strong>.
-          Pick is permanent, so choose your nemesis wisely.
+          Your rival is the person you most want to beat. When one of your teams beats
+          one of theirs head-to-head you score <strong style={{ color: S.accent }}>+{SCORING.rivalry.h2hWinBase}</strong>
+          {" "}(and lose the same if they beat you), growing bigger each knockout round. You
+          also pick up points when your rival's teams lose in the knockouts. Pick is
+          permanent, so choose your nemesis wisely.
         </p>
       </div>
       <div style={{ ...lbl }}>Your rival</div>
@@ -3014,7 +3191,6 @@ function PlayerView({ id, phone, playerId, onBack }) {
   useEffect(() => {
     if (!g || !me0 || loggedRef.current) return;
     loggedRef.current = true;
-    // atomic server-side write so it can't clobber concurrent updates
     STORAGE.patch(g.id, { op: "lastLogin", playerId: me0.id });
   }, [g, me0]);
 
@@ -3130,9 +3306,19 @@ function PlayerView({ id, phone, playerId, onBack }) {
   // PHASE 4: draft done -> dashboard. Standings is home.
   return (
     <>
-      <Header title={g.name} onBack={onBack} sub={`Playing as ${me?.name}`}
+      <Header title="Jingo"
+        sub={<span style={{ display: "block" }}>
+          <span style={{ display: "block", fontWeight: 600, opacity: 0.85 }}>World Cup 2026</span>
+          <span style={{ display: "block", marginTop: 2 }}>Playing as {me?.name}</span>
+        </span>}
         right={<button className="ghost" onClick={() => setShowHistory(true)}
-          style={{ marginTop: 4, fontSize: 13 }}>Draft log</button>} />
+          aria-label="Menu"
+          style={{ marginTop: 2, padding: "6px 8px", display: "flex", flexDirection: "column",
+            gap: 3, alignItems: "center", justifyContent: "center" }}>
+          <span style={{ width: 18, height: 2, background: S.ink, borderRadius: 2, display: "block" }} />
+          <span style={{ width: 18, height: 2, background: S.ink, borderRadius: 2, display: "block" }} />
+          <span style={{ width: 18, height: 2, background: S.ink, borderRadius: 2, display: "block" }} />
+        </button>} />
 
       {page === "standings" && (
         <StandingsHome g={g} meId={me?.id} ownerOf={ownerOf} pname={pname}
@@ -3168,6 +3354,11 @@ function PlayerView({ id, phone, playerId, onBack }) {
       {page === "rivalries" && (
         <DashSection title="Rivalries" onBack={() => setPage("standings")}>
           <RivalriesPage g={g} meId={me?.id} ownerOf={ownerOf} pname={pname} />
+        </DashSection>
+      )}
+      {page === "knockout" && (
+        <DashSection title="Knockouts" onBack={() => setPage("standings")}>
+          <KnockoutTracker g={g} meId={me?.id} ownerOf={ownerOf} pname={pname} />
         </DashSection>
       )}
       {showHistory && <DraftHistory g={g} onClose={() => setShowHistory(false)} />}
@@ -3240,8 +3431,21 @@ function StandingsHome({ g, meId, ownerOf, pname, onOpen, onOpenPlayer }) {
       {/* Leaderboard */}
       <StandingsTab g={g} highlightId={meId} onOpenPlayer={onOpenPlayer} />
 
+      {/* Knockouts button */}
+      <button onClick={() => onOpen("knockout")}
+        style={{ ...card, width: "100%", marginTop: 18, padding: "16px",
+          cursor: "pointer", fontFamily: "inherit", color: "inherit",
+          display: "flex", alignItems: "center", gap: 12, border: `1px solid ${S.accent}` }}>
+        <span style={{ fontSize: 24 }}>🏆</span>
+        <div style={{ textAlign: "left", flex: 1 }}>
+          <div style={{ fontWeight: 800, fontSize: 16 }}>Knockouts</div>
+          <div style={{ opacity: 0.6, fontSize: 12.5 }}>Live bracket + who survived the groups</div>
+        </div>
+        <span style={{ opacity: 0.4 }}>→</span>
+      </button>
+
       {/* 2x2 nav */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 18 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 }}>
         {nav.map(([key, label, icon]) => (
           <button key={key} onClick={() => onOpen(key)}
             style={{ ...card, padding: "18px 14px", cursor: "pointer", textAlign: "left",
@@ -3418,9 +3622,8 @@ function RivalPicker({ g, me, onSet, pname }) {
           </button>
           <p style={{ fontSize: 12, opacity: 0.55, margin: "8px 0 0", lineHeight: 1.5 }}>
             This is permanent — you can't change your rival once locked.
-            +{RIVAL.beatYourRival} every time one of your teams beats one of theirs.
-            And +{RIVAL.beatYourHater} every time you beat a team owned by someone who
-            picked you.
+            Beating your rival's team head-to-head scores +{SCORING.rivalry.h2hWinBase}
+            (and you lose the same if they beat you), growing each knockout round.
           </p>
         </>
       )}
@@ -3448,7 +3651,7 @@ function DraftHistory({ g, onClose }) {
           <div style={{ display: "flex", gap: 6 }}>
             <button onClick={() => setView("order")}
               className={view === "order" ? "tab on" : "tab"}
-              style={{ fontSize: 13, padding: "8px 12px", flex: "none" }}>Draft order</button>
+              style={{ fontSize: 13, padding: "8px 12px", flex: "none" }}>Draft log</button>
             <button onClick={() => setView("rules")}
               className={view === "rules" ? "tab on" : "tab"}
               style={{ fontSize: 13, padding: "8px 12px", flex: "none" }}>Scoring rules</button>
@@ -3490,7 +3693,7 @@ function ScoringRules({ g, theme }) {
   const Rule = ({ pts, children }) => (
     <div style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "7px 0",
       borderBottom: "1px solid #1d2740" }}>
-      <span style={{ minWidth: 42, fontWeight: 800, fontSize: 14,
+      <span style={{ minWidth: 52, fontWeight: 800, fontSize: 14,
         color: typeof pts === "number" && pts < 0 ? "#ff8095" : S.accent,
         fontVariantNumeric: "tabular-nums" }}>
         {typeof pts === "number" && pts > 0 ? "+" : ""}{pts}
@@ -3499,59 +3702,122 @@ function ScoringRules({ g, theme }) {
     </div>
   );
   const Section = ({ title, children }) => (
-    <div style={{ marginBottom: 16 }}>
+    <div style={{ marginBottom: 18 }}>
       <div style={{ ...lbl, marginBottom: 4 }}>{title}</div>
       {children}
     </div>
   );
+  const M = SCORING.mult, MP = SCORING.match, PR = SCORING.prog, RV = SCORING.rivalry;
+  const fames = LEGENDS.filter((l) => l.kind === "fame" && l.ready);
+  const shames = LEGENDS.filter((l) => l.kind === "shame" && l.ready);
 
   return (
     <div>
-      <Section title="Win points (per game won)">
-        {STAGES.map((s) => (
-          <Rule key={s.key} pts={g.points?.[s.key] ?? s.pts}>{s.label}</Rule>
-        ))}
-        <p style={{ fontSize: 12, opacity: 0.5, marginTop: 8, lineHeight: 1.5 }}>
-          Win points are then scaled by 48 ÷ (teams you drafted), so a smaller roster
-          earns more per win.
+      <p style={{ fontSize: 12.5, opacity: 0.6, lineHeight: 1.5, margin: "0 0 16px" }}>
+        Your score = match points + progression + rivalry + fames &amp; shames, summed
+        across every team you drafted.
+      </p>
+
+      <Section title="Match points (per team, each game)">
+        <Rule pts={MP.win}>Win</Rule>
+        <Rule pts={MP.tie}>Draw</Rule>
+        <Rule pts={MP.loss}>Loss</Rule>
+        <p style={{ fontSize: 12, opacity: 0.55, marginTop: 8, lineHeight: 1.5 }}>
+          Knockout match points are multiplied by round: Group ×{M.group}, R32 ×{M.r32},
+          R16 ×{M.r16}, QF ×{M.qf}, SF/Final ×{M.final}. So a win in the quarterfinals
+          is worth {MP.win * M.qf} match points.
         </p>
       </Section>
 
-      <Section title={`Twist: ${theme.label}`}>
-        <Rule pts={theme.amount}>{theme.blurb}</Rule>
+      <Section title="Progression (flat bonus when a team advances)">
+        <Rule pts={PR.outOfGroup}>Reaches the Round of 32 (out of group)</Rule>
+        <Rule pts={PR.winR32}>Wins in the R32 (reaches R16)</Rule>
+        <Rule pts={PR.winR16}>Wins in the R16 (reaches QF)</Rule>
+        <Rule pts={PR.winQF}>Wins in the QF (reaches SF)</Rule>
+        <Rule pts={PR.reachFinal}>Reaches the final</Rule>
+        <Rule pts={PR.winFinal}>Wins the final (champion)</Rule>
       </Section>
 
-      <Section title="Rivals">
-        <Rule pts={RIVAL.beatYourRival}>Every time your team beats a team your rival drafted.</Rule>
-        <Rule pts={RIVAL.beatYourHater}>Every time your team beats a team owned by someone who picked you as their rival.</Rule>
-        <p style={{ fontSize: 12, opacity: 0.5, marginTop: 8, lineHeight: 1.5 }}>
-          Rivals are chosen before the draft and locked permanently.
+      <Section title="Rivalry (you pick one rival before the draft)">
+        <Rule pts={`+${RV.h2hWinBase}`}>
+          Your team beats your rival's team, head-to-head (grows +{RV.h2hWinStep} each
+          knockout round — up to +{RV.h2hWinBase + RV.h2hWinStep * 5} in the final)
+        </Rule>
+        <Rule pts={RV.h2hLossBase}>
+          Your team loses to your rival's team (mirrors the win, scaling by round)
+        </Rule>
+        <Rule pts={`+${RV.schadenBase}`}>
+          Schadenfreude — your rival's team loses a knockout game (grows by round)
+        </Rule>
+        <Rule pts={`+${RV.haterBonus}`}>
+          You beat a team owned by someone who picked you as their rival, when you
+          didn't pick them
+        </Rule>
+        <p style={{ fontSize: 12, opacity: 0.55, marginTop: 8, lineHeight: 1.5 }}>
+          Rivals are locked at the draft. Total rivalry points are capped at ±{RV.netCap}.
         </p>
       </Section>
 
-      <Section title="Final">
-        <Rule pts={RIVAL.ownBothFinalists}>You drafted both teams in the final.</Rule>
-      </Section>
-
-      <Section title="Awards & Shame">
-        {LEGENDS.map((l) => (
+      <Section title="Fames (good)">
+        {fames.map((l) => (
           <Rule key={l.key} pts={l.value}>{l.emoji} {l.label} — {l.desc}</Rule>
         ))}
-        <p style={{ fontSize: 12, opacity: 0.5, marginTop: 8, lineHeight: 1.5 }}>
-          Legends are awarded by performance. If there's a tie for one, nobody gets it.
+      </Section>
+
+      <Section title="Shames (bad)">
+        {shames.map((l) => (
+          <Rule key={l.key} pts={l.value}>{l.emoji} {l.label} — {l.desc}</Rule>
+        ))}
+        <p style={{ fontSize: 12, opacity: 0.55, marginTop: 8, lineHeight: 1.5 }}>
+          Fames &amp; shames are awarded by performance and can shift as results come in.
+          Each player's fames-and-shames total is capped at ±{SCORING.fameShameCap}.
         </p>
       </Section>
+    </div>
+  );
+}
 
-      <Section title="Draft speed">
-        <Rule pts={RIVAL.speedFastest}>Fastest total draft time across all your picks.</Rule>
-        <Rule pts={RIVAL.speedSlowest}>Slowest total draft time.</Rule>
-      </Section>
-
-      {g.mode !== "inperson" && (
-        <Section title="Invitations">
-          <Rule pts={RIVAL.latePenalty}>Last player to accept the invite (unfashionably late).</Rule>
-        </Section>
-      )}
+/* A team chip used in roster lists: flag + name, struck through with the exit
+   round if eliminated, plus W/T/L record. Shared by Competition and player pages. */
+function TeamTile({ team, results, koGames = [] }) {
+  const rec = (() => {
+    let w = 0, d = 0, l = 0;
+    const all = [...groupStageFixtures(), ...koGames];
+    for (const gm of all) {
+      if (gm.home !== team && gm.away !== team) continue;
+      const res = results[gm.id]; if (!res) continue;
+      if (isDraw(res)) { d++; continue; }
+      const win = winnerOf(res); if (!win) continue;
+      if (win === team) w++; else l++;
+    }
+    return { w, d, l };
+  })();
+  const out = teamEliminationStage(team, results);
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 7,
+      background: S.card2, borderRadius: 9, padding: "7px 9px",
+      opacity: out ? 0.62 : 1 }}>
+      <span style={{ fontSize: 15 }}>{FLAG[team]}</span>
+      <span style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "baseline", gap: 5,
+        overflow: "hidden" }}>
+        <span style={{ fontSize: 12.5, fontWeight: 600,
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          textDecoration: out ? "line-through" : "none",
+          textDecorationColor: out ? "#ff8095" : "transparent" }}>
+          {team}
+        </span>
+        {out && (
+          <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.04em",
+            padding: "1px 4px", borderRadius: 4, flexShrink: 0,
+            border: "1px solid rgba(255,128,149,0.5)", color: "#ff8095",
+            textTransform: "uppercase" }}>{out}</span>
+        )}
+      </span>
+      <span style={{ display: "inline-flex", gap: 4, flexShrink: 0, fontSize: 11, fontWeight: 700 }}>
+        {rec.w > 0 && <span style={{ color: S.accent }}>{rec.w}W</span>}
+        {rec.d > 0 && <span style={{ color: "#9fb0d0" }}>{rec.d}T</span>}
+        {rec.l > 0 && <span style={{ color: "#ff8095" }}>{rec.l}L</span>}
+      </span>
     </div>
   );
 }
@@ -3671,25 +3937,7 @@ function PlayerRivals({ g, meId }) {
                 ) : (
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
                     {r.teams.map((team) => (
-                      <div key={team} style={{ display: "flex", alignItems: "center", gap: 7,
-                        background: S.card2, borderRadius: 9, padding: "7px 9px" }}>
-                        <span style={{ fontSize: 15 }}>{FLAG[team]}</span>
-                        <span style={{ flex: 1, fontSize: 12.5, fontWeight: 600,
-                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {team}
-                        </span>
-                        {(() => {
-                          const rec = teamRecord(team);
-                          return (
-                            <span style={{ display: "inline-flex", gap: 4, flexShrink: 0,
-                              fontSize: 11, fontWeight: 700 }}>
-                              {rec.w > 0 && <span style={{ color: S.accent }}>{rec.w}W</span>}
-                              {rec.d > 0 && <span style={{ color: "#9fb0d0" }}>{rec.d}T</span>}
-                              {rec.l > 0 && <span style={{ color: "#ff8095" }}>{rec.l}L</span>}
-                            </span>
-                          );
-                        })()}
-                      </div>
+                      <TeamTile key={team} team={team} results={results} koGames={g.koGames || []} />
                     ))}
                   </div>
                 )}
@@ -3891,12 +4139,7 @@ function PlayerPage({ g, playerId, meId, ownerOf, pname, onOpenAwards }) {
         <div style={{ ...lbl, marginBottom: 8 }}>Roster</div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
           {myTeams.map((team) => (
-            <div key={team} style={{ display: "flex", alignItems: "center", gap: 7,
-              background: S.card2, borderRadius: 9, padding: "8px 10px" }}>
-              <span style={{ fontSize: 15 }}>{FLAG[team]}</span>
-              <span style={{ flex: 1, fontSize: 12.5, fontWeight: 600,
-                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{team}</span>
-            </div>
+            <TeamTile key={team} team={team} results={results} koGames={g.koGames || []} />
           ))}
         </div>
       </div>
@@ -3985,6 +4228,333 @@ function LegendsPage({ g, meId, pname }) {
 function round1(n) { return Math.round(n * 10) / 10; }
 
 /* Rivalries page: each player vs their rival, with head-to-head match record. */
+/* Knockout Tracker: live bracket (owner names + flags) and a group-stage
+   summary of how each player's teams fared getting out of the groups. */
+function KnockoutTracker({ g, meId, ownerOf, pname }) {
+  const [tab, setTab] = useState("bracket");
+  const results = { ...(g.results || {}), ...RESULTS.get() };
+
+  // Resolve the winning TEAM of any knockout node id, recursively.
+  // R32 ids resolve from fixtures + results; deeper rounds resolve from BRACKET.
+  const r32by = Object.fromEntries(R32_FIXTURES.map((f) => [f.id, f]));
+  const nodeIndex = {};
+  [...BRACKET.r16, ...BRACKET.qf, ...BRACKET.sf, ...BRACKET.final]
+    .forEach((n) => { nodeIndex[n.id] = n; });
+
+  function winnerTeamOf(id) {
+    if (r32by[id]) {
+      const res = results[id];
+      return res ? winnerOf(res) : null;
+    }
+    return results[id] ? winnerOf(results[id]) : null;
+  }
+  // The two teams contesting a node (may be null if earlier round undecided).
+  function teamsOf(id) {
+    if (r32by[id]) return [r32by[id].home, r32by[id].away];
+    const node = nodeIndex[id];
+    if (!node) return [null, null];
+    return node.feeds.map((childId) => winnerTeamOf(childId));
+  }
+
+  const meName = pname(meId);
+  // One slot in the bracket: shows owner (or team if unowned) + flag.
+  // align "right" puts the flag on the right and right-justifies (mirrored half).
+  const Slot = ({ team, advanced, align = "left" }) => {
+    const owner = team ? ownerOf(team) : null;
+    const mine = owner && owner === meId;
+    const flag = <span style={{ fontSize: 13 }}>{team ? FLAG[team] : "—"}</span>;
+    const name = (
+      <span style={{ fontSize: 12, fontWeight: mine ? 800 : 600,
+        color: mine ? S.accent : S.ink, whiteSpace: "nowrap",
+        overflow: "hidden", textOverflow: "ellipsis" }}>
+        {team ? (owner ? pname(owner) : team) : "TBD"}
+      </span>
+    );
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 6,
+        flexDirection: align === "right" ? "row-reverse" : "row",
+        padding: "5px 8px", borderRadius: 7, minWidth: 0,
+        background: advanced ? "rgba(61,220,151,0.14)" : S.card2,
+        border: `1px solid ${mine ? S.accent : "transparent"}`,
+        opacity: team ? 1 : 0.4 }}>
+        {flag}{name}
+      </div>
+    );
+  };
+
+  // A match box: its two slots, winner highlighted. `align` right-aligns content
+  // for the mirrored right half. `spacer` adds top margin to vertically center
+  // a box against its two feeder boxes (the classic bracket stagger).
+  const MatchBox = ({ id, label, align = "left", spacer = 0 }) => {
+    const [t1, t2] = teamsOf(id);
+    const w = winnerTeamOf(id);
+    return (
+      <div style={{ marginBottom: 10, marginTop: spacer }}>
+        {label && <div style={{ fontSize: 9.5, opacity: 0.4, fontWeight: 700,
+          textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3,
+          textAlign: align }}>{label}</div>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          <Slot team={t1} advanced={w && t1 === w} align={align} />
+          <Slot team={t2} advanced={w && t2 === w} align={align} />
+        </div>
+      </div>
+    );
+  };
+
+  // Bracket laid out by round columns. Deeper rounds get more top spacing so
+  // each box sits centered against its feeders.
+  const Column = ({ title, children, align = "left" }) => (
+    <div style={{ minWidth: 128, flex: "0 0 auto" }}>
+      <div style={{ ...lbl, fontSize: 10, marginBottom: 8, textAlign: "center" }}>{title}</div>
+      {children}
+    </div>
+  );
+
+  return (
+    <>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+        {[["bracket", "Bracket"], ["group", "Group stage"], ["r32", "R32"]].map(([k, l]) => (
+          <button key={k} onClick={() => setTab(k)}
+            style={{ flex: 1, padding: "9px 12px", borderRadius: 10, fontWeight: 700,
+              fontSize: 13.5, fontFamily: "inherit", cursor: "pointer",
+              border: `1px solid ${tab === k ? S.accent : "#222d47"}`,
+              background: tab === k ? S.card2 : "transparent",
+              color: tab === k ? S.accent : S.ink }}>{l}</button>
+        ))}
+      </div>
+
+      {tab === "bracket" ? (
+        <>
+          <p style={{ fontSize: 12, opacity: 0.55, margin: "0 0 12px", lineHeight: 1.5 }}>
+            Both halves feed into the Final in the middle. Each slot shows the player who
+            owns that team; your teams are highlighted. Scroll sideways to see it all.
+          </p>
+          <div style={{ overflowX: "auto", paddingBottom: 8 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", minWidth: "min-content" }}>
+              {/* LEFT HALF — flows left to right */}
+              <Column title="R32">
+                {["r32-3", "r32-6", "r32-1", "r32-4", "r32-12", "r32-11", "r32-10", "r32-9"]
+                  .map((id) => <MatchBox key={id} id={id} />)}
+              </Column>
+              <Column title="R16">
+                {["r16-1", "r16-2", "r16-3", "r16-4"].map((id, i) =>
+                  <MatchBox key={id} id={id} spacer={i === 0 ? 38 : 76} />)}
+              </Column>
+              <Column title="QF">
+                {["qf-1", "qf-2"].map((id, i) =>
+                  <MatchBox key={id} id={id} spacer={i === 0 ? 114 : 228} />)}
+              </Column>
+              <Column title="SF">
+                <MatchBox id="sf-1" spacer={266} />
+              </Column>
+
+              {/* CENTER — the Final */}
+              <Column title="🏆 Final">
+                <MatchBox id="final-1" spacer={290} />
+              </Column>
+
+              {/* RIGHT HALF — flows right to left (columns reversed, slots right-aligned) */}
+              <Column title="SF" align="right">
+                <MatchBox id="sf-2" align="right" spacer={266} />
+              </Column>
+              <Column title="QF" align="right">
+                {["qf-3", "qf-4"].map((id, i) =>
+                  <MatchBox key={id} id={id} align="right" spacer={i === 0 ? 114 : 228} />)}
+              </Column>
+              <Column title="R16" align="right">
+                {["r16-5", "r16-6", "r16-7", "r16-8"].map((id, i) =>
+                  <MatchBox key={id} id={id} align="right" spacer={i === 0 ? 38 : 76} />)}
+              </Column>
+              <Column title="R32" align="right">
+                {["r32-2", "r32-5", "r32-7", "r32-8", "r32-15", "r32-14", "r32-13", "r32-16"]
+                  .map((id) => <MatchBox key={id} id={id} align="right" />)}
+              </Column>
+            </div>
+          </div>
+        </>
+      ) : tab === "group" ? (
+        <KnockoutGroupSummary g={g} meId={meId} ownerOf={ownerOf} pname={pname} />
+      ) : (
+        <KnockoutR32Summary g={g} meId={meId} ownerOf={ownerOf} pname={pname} />
+      )}
+    </>
+  );
+}
+
+/* Group-stage summary: who got the most teams through to the R32, with a
+   breakdown of finishing positions. Sorted by most-advanced first. */
+/* Points box: big total + a small breakdown (games W-L-T, progression, rivalry).
+   Shared by the Group stage and R32 round summaries. */
+function PointsBox({ p }) {
+  const Line = ({ label, val }) => (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 10.5 }}>
+      <span style={{ opacity: 0.55 }}>{label}</span>
+      <span style={{ fontWeight: 700, fontVariantNumeric: "tabular-nums",
+        color: val < 0 ? "#ff8095" : S.ink }}>
+        {val > 0 && (label === "Progression" || label === "Rivalry") ? "+" : ""}{val}
+      </span>
+    </div>
+  );
+  return (
+    <div style={{ background: S.card2, borderRadius: 10, padding: "9px 11px",
+      minWidth: 116, flexShrink: 0 }}>
+      <div style={{ textAlign: "right", marginBottom: 6 }}>
+        <span style={{ fontWeight: 800, fontSize: 22, color: S.accent,
+          fontVariantNumeric: "tabular-nums" }}>{p.total}</span>
+        <span style={{ fontSize: 10.5, opacity: 0.5, fontWeight: 600 }}> pts</span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 2,
+        paddingTop: 6, borderTop: "1px solid #1d2740" }}>
+        <Line label={`Games ${p.wins}-${p.losses}-${p.draws}`} val={p.match} />
+        <Line label="Progression" val={p.prog} />
+        <Line label="Rivalry" val={p.rival} />
+      </div>
+    </div>
+  );
+}
+
+function KnockoutGroupSummary({ g, meId, ownerOf, pname }) {
+  const pts = roundPoints(g, "group");
+  const rows = g.players.map((p) => {
+    const teams = g.picks.filter((x) => x.playerId === p.id).map((x) => x.team);
+    let first = 0, second = 0, third = 0, out = 0;
+    teams.forEach((t) => {
+      const pos = GROUP_OUTCOME[t];
+      if (pos === 1) first++;
+      else if (pos === 2) second++;
+      else if (pos === 3) third++;
+      else out++;
+    });
+    const advanced = first + second + third;
+    return { id: p.id, name: p.name, teams: teams.length, first, second, third, out, advanced,
+      points: pts[p.id], pct: teams.length ? Math.round((advanced / teams.length) * 100) : 0 };
+  }).sort((a, b) => b.advanced - a.advanced || b.pct - a.pct);
+
+  const Tag = ({ n, label, color }) => (
+    <div style={{ flex: 1, textAlign: "center" }}>
+      <div style={{ fontWeight: 800, fontSize: 15, color, fontVariantNumeric: "tabular-nums" }}>{n}</div>
+      <div style={{ fontSize: 9.5, opacity: 0.5, fontWeight: 600 }}>{label}</div>
+    </div>
+  );
+
+  return (
+    <>
+      <p style={{ fontSize: 12, opacity: 0.55, margin: "0 0 12px", lineHeight: 1.5 }}>
+        How each player's teams did getting out of the groups — most teams through, on top.
+      </p>
+      {rows.map((r, i) => (
+        <div key={r.id} style={{ ...card, marginBottom: 8, padding: "12px 14px",
+          borderColor: r.id === meId ? S.accent : "#222d47" }}>
+          <div style={{ display: "flex", alignItems: "stretch", gap: 12 }}>
+            {/* left: player + big advanced stat */}
+            <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 18, fontWeight: 800, width: 22, textAlign: "center",
+                  color: i === 0 ? S.accent : S.ink, opacity: i === 0 ? 1 : 0.4 }}>{i + 1}</span>
+                <span style={{ fontWeight: 700, fontSize: 15 }}>
+                  {r.name}{r.id === meId ? " (you)" : ""}</span>
+              </div>
+              <div style={{ marginTop: 6, paddingLeft: 32 }}>
+                <span style={{ fontWeight: 800, fontSize: 26, color: S.accent,
+                  fontVariantNumeric: "tabular-nums" }}>{r.advanced}/{r.teams}</span>
+                <span style={{ fontSize: 11.5, opacity: 0.5, marginLeft: 6 }}>through · {r.pct}%</span>
+              </div>
+              <div style={{ display: "flex", gap: 4, marginTop: 10, paddingLeft: 32,
+                paddingTop: 8, borderTop: "1px solid #1d2740" }}>
+                <Tag n={r.first} label="1st" color={S.accent} />
+                <Tag n={r.second} label="2nd" color={S.accent} />
+                <Tag n={r.third} label="3rd ✓" color="#9fb0d0" />
+                <Tag n={r.out} label="out" color="#ff8095" />
+              </div>
+            </div>
+            {/* right: points box */}
+            <PointsBox p={r.points} />
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+/* R32 summary: of each player's teams that reached the Round of 32, how many
+   won their R32 game (advancing to the R16) vs lost. Sorted by most wins. */
+function KnockoutR32Summary({ g, meId, ownerOf, pname }) {
+  const results = { ...(g.results || {}), ...RESULTS.get() };
+  const r32teams = new Set();
+  R32_FIXTURES.forEach((f) => { r32teams.add(f.home); r32teams.add(f.away); });
+  // resolve each R32 game's winner/loser
+  const r32by = Object.fromEntries(R32_FIXTURES.map((f) => [f.id, f]));
+  const teamR32Outcome = (team) => {
+    // find the R32 fixture this team is in
+    const fxt = R32_FIXTURES.find((f) => f.home === team || f.away === team);
+    if (!fxt) return "n/a"; // didn't reach R32
+    const res = results[fxt.id];
+    if (!res) return "pending"; // game not played yet
+    const w = winnerOf(res);
+    if (!w) return "pending";
+    return w === team ? "won" : "lost";
+  };
+
+  const pts = roundPoints(g, "r32");
+  const rows = g.players.map((p) => {
+    const teams = g.picks.filter((x) => x.playerId === p.id).map((x) => x.team);
+    const inR32 = teams.filter((t) => r32teams.has(t));
+    let won = 0, lost = 0, pending = 0;
+    inR32.forEach((t) => {
+      const o = teamR32Outcome(t);
+      if (o === "won") won++;
+      else if (o === "lost") lost++;
+      else pending++;
+    });
+    const decided = won + lost;
+    return { id: p.id, name: p.name, inR32: inR32.length, won, lost, pending,
+      points: pts[p.id], pct: decided ? Math.round((won / decided) * 100) : 0 };
+  }).sort((a, b) => b.won - a.won || b.pct - a.pct);
+
+  const Tag = ({ n, label, color }) => (
+    <div style={{ flex: 1, textAlign: "center" }}>
+      <div style={{ fontWeight: 800, fontSize: 15, color, fontVariantNumeric: "tabular-nums" }}>{n}</div>
+      <div style={{ fontSize: 9.5, opacity: 0.5, fontWeight: 600 }}>{label}</div>
+    </div>
+  );
+
+  return (
+    <>
+      <p style={{ fontSize: 12, opacity: 0.55, margin: "0 0 12px", lineHeight: 1.5 }}>
+        Of each player's teams that reached the Round of 32, how many won their R32
+        game and moved on — most wins on top.
+      </p>
+      {rows.map((r, i) => (
+        <div key={r.id} style={{ ...card, marginBottom: 8, padding: "12px 14px",
+          borderColor: r.id === meId ? S.accent : "#222d47" }}>
+          <div style={{ display: "flex", alignItems: "stretch", gap: 12 }}>
+            <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 18, fontWeight: 800, width: 22, textAlign: "center",
+                  color: i === 0 ? S.accent : S.ink, opacity: i === 0 ? 1 : 0.4 }}>{i + 1}</span>
+                <span style={{ fontWeight: 700, fontSize: 15 }}>
+                  {r.name}{r.id === meId ? " (you)" : ""}</span>
+              </div>
+              <div style={{ marginTop: 6, paddingLeft: 32 }}>
+                <span style={{ fontWeight: 800, fontSize: 26, color: S.accent,
+                  fontVariantNumeric: "tabular-nums" }}>{r.won}/{r.inR32}</span>
+                <span style={{ fontSize: 11.5, opacity: 0.5, marginLeft: 6 }}>won · {r.pct}%</span>
+              </div>
+              <div style={{ display: "flex", gap: 4, marginTop: 10, paddingLeft: 32,
+                paddingTop: 8, borderTop: "1px solid #1d2740" }}>
+                <Tag n={r.won} label="won" color={S.accent} />
+                <Tag n={r.lost} label="out" color="#ff8095" />
+                <Tag n={r.pending} label="to play" color="#9fb0d0" />
+              </div>
+            </div>
+            <PointsBox p={r.points} />
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
 function RivalriesPage({ g, meId, ownerOf, pname }) {
   const rivals = g.rivals || {};
   const results = { ...(g.results || {}), ...RESULTS.get() };
