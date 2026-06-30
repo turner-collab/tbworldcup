@@ -3,8 +3,7 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 
 /* ============================================================================
    WORLD CUP DRAFT — single-file app
-   Persistence: window.storage (artifact KV). Swap STORAGE.* for a real
-   backend (fetch to your API) when you host it; the rest of the app is agnostic.
+   Persistence: Supabase via /api/groups routes (see STORAGE below).
    Notifications: NOTIFY.draftTurn() is a stub that logs. Wire Twilio there
    (server-side) by replacing the body with a fetch to your /notify endpoint.
 ============================================================================ */
@@ -56,6 +55,41 @@ const STAGES = [
   { key: "final", label: "Final", pts: 13 },
 ];
 const DEFAULT_POINTS = Object.fromEntries(STAGES.map((s) => [s.key, s.pts]));
+
+/* ============================================================================
+   OFFICIAL 2026 WORLD CUP ROUND OF 32 BRACKET
+   The 16 R32 matchups with ET kickoff dates/times, plus the games already
+   finished. Used by the admin "Load R32 bracket" action to add knockout games
+   to every group at once. IDs are stable (r32-N) so re-running is idempotent.
+   Teams use the app's canonical names so ownerOf() matches.
+============================================================================ */
+const R32_FIXTURES = [
+  { id: "r32-1",  home: "South Africa", away: "Canada",   date: "2026-06-28", day: "Sun", time: "3:00 PM" },
+  { id: "r32-2",  home: "Brazil",       away: "Japan",    date: "2026-06-29", day: "Mon", time: "1:00 PM" },
+  { id: "r32-3",  home: "Germany",      away: "Paraguay", date: "2026-06-29", day: "Mon", time: "4:30 PM" },
+  { id: "r32-4",  home: "Netherlands",  away: "Morocco",  date: "2026-06-29", day: "Mon", time: "9:00 PM" },
+  { id: "r32-5",  home: "Ivory Coast",  away: "Norway",   date: "2026-06-30", day: "Tue", time: "1:00 PM" },
+  { id: "r32-6",  home: "France",       away: "Sweden",   date: "2026-06-30", day: "Tue", time: "5:00 PM" },
+  { id: "r32-7",  home: "Mexico",       away: "Ecuador",  date: "2026-06-30", day: "Tue", time: "9:00 PM" },
+  { id: "r32-8",  home: "England",      away: "DR Congo", date: "2026-07-01", day: "Wed", time: "12:00 PM" },
+  { id: "r32-9",  home: "Belgium",      away: "Senegal",  date: "2026-07-01", day: "Wed", time: "4:00 PM" },
+  { id: "r32-10", home: "United States",away: "Bosnia and Herzegovina", date: "2026-07-01", day: "Wed", time: "8:00 PM" },
+  { id: "r32-11", home: "Spain",        away: "Austria",  date: "2026-07-02", day: "Thu", time: "3:00 PM" },
+  { id: "r32-12", home: "Portugal",     away: "Croatia",  date: "2026-07-02", day: "Thu", time: "7:00 PM" },
+  { id: "r32-13", home: "Switzerland",  away: "Algeria",  date: "2026-07-02", day: "Thu", time: "11:00 PM" },
+  { id: "r32-14", home: "Australia",    away: "Egypt",    date: "2026-07-03", day: "Fri", time: "2:00 PM" },
+  { id: "r32-15", home: "Argentina",    away: "Cape Verde", date: "2026-07-03", day: "Fri", time: "6:00 PM" },
+  { id: "r32-16", home: "Colombia",     away: "Ghana",    date: "2026-07-03", day: "Fri", time: "9:30 PM" },
+];
+// R32 games already completed. {h,a} are goals in the fixture's listed home/away
+// orientation; w is the advancing team (pen:true where decided on penalties).
+const R32_RESULTS = {
+  "r32-1": { h: 0, a: 1, w: "Canada" },                 // South Africa 0-1 Canada
+  "r32-2": { h: 2, a: 1, w: "Brazil" },                 // Brazil 2-1 Japan
+  "r32-3": { h: 1, a: 1, w: "Paraguay", pen: true },    // Germany 1-1 Paraguay (pens 3-4)
+  "r32-4": { h: 1, a: 1, w: "Morocco", pen: true },     // Netherlands 1-1 Morocco (pens 2-3)
+};
+
 
 /* Scoring themes — group picks one at setup. `bonus(game, winner)` returns
    extra points credited to the winning team's owner for that game. */
@@ -201,6 +235,7 @@ const RESULTS = {
   subscribe(fn) { _resultSubs.add(fn); return () => _resultSubs.delete(fn); },
 };
 
+
 // Derive the winning team from a result value (handles goals object,
 // legacy string, and "DRAW"). Returns null if no decisive winner.
 function winnerOf(res) {
@@ -222,16 +257,22 @@ function scoreText(res) {
 }
 
 // Hook: live shared results, re-rendering when any score changes.
-function useSharedResults() {
+function useSharedResults(livePollActive) {
   const [results, setResults] = useState(() => RESULTS.get());
   useEffect(() => {
     let alive = true;
     RESULTS.load().then((r) => { if (alive) setResults({ ...r }); });
     const unsub = RESULTS.subscribe((r) => setResults({ ...r }));
-    // light polling so other devices' entries show up
-    const iv = setInterval(() => { RESULTS.load().then((r) => { if (alive) setResults({ ...r }); }); }, 5000);
-    return () => { alive = false; unsub(); clearInterval(iv); };
-  }, []);
+    // Only poll when a live game is in progress, and then every 5 minutes.
+    // With no live game there's nothing to update, so we skip polling entirely.
+    let iv = null;
+    if (livePollActive) {
+      iv = setInterval(() => {
+        RESULTS.load().then((r) => { if (alive) setResults({ ...r }); });
+      }, 5 * 60 * 1000);
+    }
+    return () => { alive = false; unsub(); if (iv) clearInterval(iv); };
+  }, [livePollActive]);
   return results;
 }
 
@@ -651,10 +692,15 @@ function AdminAllScores({ onBack }) {
     else w = game.stage === "group" ? "DRAW" : "PEN"; // knockout tie -> needs penalty winner
     await RESULTS.set(game.id, { h: hg, a: ag, w });
   }
-  async function setPenWinner(game, team) {
+  async function setPenWinner(game, team, penH, penA) {
     const res = results[game.id];
     if (!res || typeof res === "string") return;
-    await RESULTS.set(game.id, { ...res, w: team, pen: true });
+    const next = { ...res, w: team, pen: true };
+    // optional shootout tally (display only; doesn't change who advanced)
+    const ph = penH === "" || penH == null ? undefined : Math.max(0, parseInt(penH, 10) || 0);
+    const pa = penA === "" || penA == null ? undefined : Math.max(0, parseInt(penA, 10) || 0);
+    if (ph != null && pa != null) { next.ph = ph; next.pa = pa; }
+    await RESULTS.set(game.id, next);
   }
   function addKo() {
     if (!koHome || !koAway || koHome === koAway) return;
@@ -685,12 +731,12 @@ function AdminAllScores({ onBack }) {
             <select className="inp" value={koHome} onChange={(e) => setKoHome(e.target.value)}
               style={{ flex: 1, minWidth: 120 }}>
               <option value="">Home…</option>
-              {ALL_TEAMS.map((t) => <option key={t} value={t}>{t}</option>)}
+              {ALL_TEAMS.map((t) => <option key={t.name} value={t.name}>{t.name}</option>)}
             </select>
             <select className="inp" value={koAway} onChange={(e) => setKoAway(e.target.value)}
               style={{ flex: 1, minWidth: 120 }}>
               <option value="">Away…</option>
-              {ALL_TEAMS.map((t) => <option key={t} value={t}>{t}</option>)}
+              {ALL_TEAMS.map((t) => <option key={t.name} value={t.name}>{t.name}</option>)}
             </select>
             <button className="primary" onClick={addKo} style={{ padding: "8px 14px" }}>Add</button>
           </div>
@@ -719,21 +765,25 @@ function AdminScoreRow({ game, res, onGoals, onPenWinner }) {
   const obj = res && typeof res === "object" ? res : null;
   const [h, setH] = useState(obj && obj.h != null ? String(obj.h) : "");
   const [a, setA] = useState(obj && obj.a != null ? String(obj.a) : "");
+  const [penH, setPenH] = useState(obj && obj.ph != null ? String(obj.ph) : "");
+  const [penA, setPenA] = useState(obj && obj.pa != null ? String(obj.pa) : "");
   // keep local inputs in sync if another device changes the score
   useEffect(() => {
     const o = res && typeof res === "object" ? res : null;
-    setH(o && o.h != null ? String(o.h) : (typeof res === "string" ? "" : ""));
+    setH(o && o.h != null ? String(o.h) : "");
     setA(o && o.a != null ? String(o.a) : "");
+    setPenH(o && o.ph != null ? String(o.ph) : "");
+    setPenA(o && o.pa != null ? String(o.pa) : "");
   }, [res]);
 
   const w = winnerOf(res);
   const drawn = isDraw(res);
   const needsPen = obj && obj.w === "PEN";
-  const goalInput = (val, set, onCommit) => (
+  const goalInput = (val, set, onCommit, w0 = 52) => (
     <input className="inp" inputMode="numeric" value={val}
       onChange={(e) => { const v = e.target.value.replace(/\D/g, "").slice(0, 2); set(v); }}
       onBlur={onCommit} placeholder="–"
-      style={{ width: 52, textAlign: "center", fontWeight: 800, fontSize: 18, padding: "8px 4px" }} />
+      style={{ width: w0, textAlign: "center", fontWeight: 800, fontSize: 18, padding: "8px 4px" }} />
   );
 
   return (
@@ -766,11 +816,20 @@ function AdminScoreRow({ game, res, onGoals, onPenWinner }) {
         {needsPen ? (
           <div>
             <div style={{ color: "#ffd166", fontWeight: 700, marginBottom: 6 }}>
-              Level after 90 — who won on penalties?
+              Level after 90 — penalty shootout
             </div>
+            {/* optional tally */}
+            <div style={{ display: "flex", gap: 6, justifyContent: "center", alignItems: "center",
+              marginBottom: 8 }}>
+              <span style={{ fontSize: 11, opacity: 0.6 }}>Pens:</span>
+              {goalInput(penH, setPenH, () => {}, 40)}
+              <span style={{ opacity: 0.4, fontWeight: 700 }}>–</span>
+              {goalInput(penA, setPenA, () => {}, 40)}
+            </div>
+            <div style={{ fontSize: 11, opacity: 0.55, marginBottom: 6 }}>Tap the team that won:</div>
             <div style={{ display: "flex", gap: 6, justifyContent: "center" }}>
               {[game.home, game.away].map((t) => (
-                <button key={t} onClick={() => onPenWinner(game, t)}
+                <button key={t} onClick={() => onPenWinner(game, t, penH, penA)}
                   className="tab" style={{ padding: "6px 12px", fontSize: 12.5 }}>{t} (pens)</button>
               ))}
             </div>
@@ -778,7 +837,10 @@ function AdminScoreRow({ game, res, onGoals, onPenWinner }) {
         ) : drawn ? (
           <span style={{ color: "#9fb0d0", fontWeight: 700 }}>Draw</span>
         ) : w ? (
-          <span style={{ color: S.winB, fontWeight: 700 }}>{w} win{obj && obj.pen ? " (pens)" : ""}</span>
+          <span style={{ color: S.winB, fontWeight: 700 }}>
+            {w} win{obj && obj.pen ? (obj.ph != null && obj.pa != null
+              ? ` (pens ${obj.ph}–${obj.pa})` : " (pens)") : ""}
+          </span>
         ) : (
           <span style={{ opacity: 0.4 }}>Enter goals to record this match</span>
         )}
@@ -2062,7 +2124,7 @@ function lastAccepter(g) {
   return last[0];
 }
 
-function computeStandings(g) {
+function computeStandings(g, resultsOverride) {
   const rosterSize = {};
   g.players.forEach((p) => { rosterSize[p.id] = g.picks.filter((x) => x.playerId === p.id).length; });
   const ownerOf = (team) => g.picks.find((p) => p.team === team)?.playerId;
@@ -2081,8 +2143,9 @@ function computeStandings(g) {
 
   const ko = g.koGames || [];
   const allGames = [...groupStageFixtures(), ...ko];
-  // Results are shared across all groups.
-  const sharedResults = { ...(g.results || {}), ...RESULTS.get() };
+  // Results are shared across all groups. An explicit override (used for
+  // single-game point-delta math) takes precedence when provided.
+  const sharedResults = resultsOverride || { ...(g.results || {}), ...RESULTS.get() };
   const M = SCORING.mult, D = SCORING.depth, MP = SCORING.match, PR = SCORING.prog, RV = SCORING.rivalry;
 
   // Helper: rounds a player owns a rival relationship with the loser's owner.
@@ -2482,6 +2545,96 @@ function gameSortKey(gm) {
   }
   return base + mins * 60 * 1000;
 }
+
+/* ---------- "Today's slate" logic (3am ET turnover) ----------
+   Games are listed in US Eastern time. The visible day doesn't roll over at
+   midnight but at 3am ET, so late-night games stay on the previous day's slate
+   until everyone's had a chance to check. We figure out "now" in ET without
+   external libs by reading the wall clock in the America/New_York zone. */
+function nowPartsET() {
+  // Returns { y, m, d, hh, mm } for the current moment in America/New_York.
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit",
+    day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+  const parts = {};
+  for (const p of fmt.formatToParts(new Date())) {
+    if (p.type !== "literal") parts[p.type] = p.value;
+  }
+  return {
+    y: +parts.year, m: +parts.month, d: +parts.day,
+    hh: +(parts.hour === "24" ? "0" : parts.hour), mm: +parts.minute,
+  };
+}
+// The slate date (YYYY-MM-DD) for "now": before 3am ET it's still yesterday.
+function currentSlateDate() {
+  const p = nowPartsET();
+  // Build a date at noon to avoid DST edge issues, then shift back if before 3am.
+  let dt = new Date(Date.UTC(p.y, p.m - 1, p.d, 12, 0, 0));
+  if (p.hh < 3) dt = new Date(dt.getTime() - 24 * 60 * 60 * 1000);
+  return dt.toISOString().slice(0, 10);
+}
+// Kickoff as an absolute timestamp, interpreting the fixture's ET clock time.
+// We approximate ET as UTC-4 (EDT, correct for June–Oct 2026 incl. the WC).
+function gameKickoffTs(gm) {
+  if (!gm || !gm.date) return null;
+  let mins = 12 * 60;
+  if (gm.time) {
+    const mt = gm.time.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    if (mt) {
+      let h = parseInt(mt[1], 10) % 12;
+      if (/PM/i.test(mt[3])) h += 12;
+      mins = h * 60 + parseInt(mt[2], 10);
+    }
+  }
+  // ET (EDT = UTC-4): the UTC instant is the ET wall time + 4 hours.
+  const [Y, M, D] = gm.date.split("-").map(Number);
+  return Date.UTC(Y, M - 1, D, 4, 0, 0) + mins * 60 * 1000;
+}
+// A game is "live" if it has kicked off, isn't finished, and we're within a
+// generous window after kickoff (matches run ~2h; allow 3h for stoppage/half).
+function isGameLive(gm, results) {
+  if (!gm) return false;
+  if (results && results[gm.id]) return false; // has a result -> final
+  const ko = gameKickoffTs(gm);
+  if (ko == null) return false;
+  const now = Date.now();
+  return now >= ko && now <= ko + 3.5 * 60 * 60 * 1000;
+}
+// The ET slate window for a given slate date is [3am that date, 3am next date).
+// A game belongs to the slate if its kickoff falls in that window. This matches
+// the real-world feel: a 1am game counts on the previous day's slate.
+function slateWindow(dateStr) {
+  const [Y, M, D] = dateStr.split("-").map(Number);
+  // 3am ET (EDT = UTC-4) -> 07:00 UTC
+  const start = Date.UTC(Y, M - 1, D, 7, 0, 0);
+  return { start, end: start + 24 * 60 * 60 * 1000 };
+}
+// All games whose kickoff falls in the slate window for dateStr, sorted by time.
+function gamesOnDate(allGames, dateStr) {
+  const { start, end } = slateWindow(dateStr);
+  return allGames.filter((gm) => {
+    const ko = gameKickoffTs(gm);
+    return ko != null && ko >= start && ko < end;
+  }).sort((a, b) => gameSortKey(a) - gameSortKey(b));
+}
+// Today's slate, rolling forward to the next slate day that actually has games.
+function todaysSlate(allGames) {
+  const today = currentSlateDate();
+  const onToday = gamesOnDate(allGames, today);
+  if (onToday.length > 0) return { date: today, games: onToday, rolledForward: false };
+  // roll forward day by day (up to ~40 days) to the next slate with games
+  let cursor = today;
+  for (let i = 0; i < 45; i++) {
+    const [Y, M, D] = cursor.split("-").map(Number);
+    const next = new Date(Date.UTC(Y, M - 1, D, 12) + 24 * 60 * 60 * 1000)
+      .toISOString().slice(0, 10);
+    const gs = gamesOnDate(allGames, next);
+    if (gs.length) return { date: next, games: gs, rolledForward: true };
+    cursor = next;
+  }
+  return { date: today, games: [], rolledForward: false };
+}
 /* ---------- Player dashboard: Roster / Upcoming / Home ---------- */
 function fmtDate(iso) {
   if (!iso) return "TBD";
@@ -2844,7 +2997,14 @@ function PlayerView({ id, phone, playerId, onBack }) {
   const [ackedPick, setAckedPick] = useState(-1); // last pickIdx the player tapped "YOU'RE UP" for
   const [ackedAt, setAckedAt] = useState(null); // timestamp the player tapped it (clock start)
   const { g, notFound: missing, save, patch } = usePolledGroup(id);
-  useSharedResults(); // re-render this view when any shared score changes
+  // Is any game live right now? Drives 5-min polling (and none when nothing's live).
+  const liveActive = useMemo(() => {
+    if (!g) return false;
+    const all = [...groupStageFixtures(), ...(g.koGames || [])];
+    const merged = { ...(g.results || {}), ...RESULTS.get() };
+    return all.some((gm) => isGameLive(gm, merged));
+  }, [g]);
+  useSharedResults(liveActive); // re-render on score changes; poll only when live
 
   // Record this player's last login on the group (once per mount).
   const me0 = g && (playerId
@@ -3028,37 +3188,54 @@ function DashSection({ title, onBack, children }) {
 }
 
 /* Standings home: leaderboard + next game + 2x2 nav + rivalries button. */
+// Points each player gained/lost from a single finished game, by diffing the
+// full standings with vs without that game's result. Reuses the real engine.
+function gamePointDeltas(g, gameId) {
+  const merged = { ...(g.results || {}), ...RESULTS.get() };
+  if (!merged[gameId]) return null;
+  const withMap = computeStandings(g, merged);
+  const without = { ...merged }; delete without[gameId];
+  const withoutMap = computeStandings(g, without);
+  const out = {};
+  withMap.forEach((r) => {
+    const before = withoutMap.find((b) => b.id === r.id);
+    out[r.id] = { name: r.name, delta: Math.round((r.total - (before ? before.total : 0)) * 10) / 10 };
+  });
+  return out;
+}
+
 function StandingsHome({ g, meId, ownerOf, pname, onOpen, onOpenPlayer }) {
-  const next = useMemo(() => nextUpcomingGame(g), [g]);
-  const theme = THEMES[g.theme] || THEMES[DEFAULT_THEME];
-  // show the special rule only if the next game involves a country it applies to
-  const themeApplies = next && theme.targets &&
-    (theme.targets.includes(next.home) || theme.targets.includes(next.away));
+  const allGames = useMemo(() => [...groupStageFixtures(), ...(g.koGames || [])], [g]);
+  const merged = useMemo(() => ({ ...(g.results || {}), ...RESULTS.get() }), [g]);
+  const slate = useMemo(() => todaysSlate(allGames), [allGames]);
   const nav = [
     ["roster", "My Roster", "📋"], ["upcoming", "Games", "📅"],
     ["legends", "Fames & Shames", "🏷️"], ["competition", "Competition", "🌍"],
   ];
+  const slateLabel = (() => {
+    const d = new Date(slate.date + "T12:00:00");
+    const lbl = d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+    return slate.rolledForward ? `Next match day · ${lbl}` : `Today · ${lbl}`;
+  })();
   return (
     <>
-      {/* Next game spotlight */}
-      {next && (
-        <div style={{ ...card, marginBottom: 14, borderColor: S.accent, padding: "14px 16px" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-            <span style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase",
-              letterSpacing: "0.1em", color: S.accent }}>Next up</span>
-            <span style={{ fontSize: 12, opacity: 0.7, fontWeight: 600 }}>{fmtWhen(next)}</span>
-          </div>
-          <NextSide team={next.home} ownerOf={ownerOf} pname={pname} meId={meId} />
-          <div style={{ textAlign: "center", fontSize: 11, opacity: 0.35, margin: "3px 0" }}>vs</div>
-          <NextSide team={next.away} ownerOf={ownerOf} pname={pname} meId={meId} />
-          {themeApplies && (
-            <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10,
-              background: "rgba(36,152,218,0.16)", fontSize: 12.5, lineHeight: 1.4 }}>
-              ⚡ <strong>{theme.label}</strong> in effect this match — {theme.blurb} (+{theme.amount})
-            </div>
-          )}
+      {/* Today's slate */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+          marginBottom: 10 }}>
+          <span style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase",
+            letterSpacing: "0.1em", color: S.accent }}>{slateLabel}</span>
+          <span style={{ fontSize: 11, opacity: 0.5 }}>{slate.games.length} game{slate.games.length === 1 ? "" : "s"}</span>
         </div>
-      )}
+        {slate.games.length === 0 ? (
+          <div style={{ ...card, textAlign: "center", padding: "22px 16px", opacity: 0.6 }}>
+            No games scheduled.
+          </div>
+        ) : slate.games.map((gm) => (
+          <SlateGame key={gm.id} g={g} gm={gm} results={merged}
+            ownerOf={ownerOf} pname={pname} meId={meId} />
+        ))}
+      </div>
 
       {/* Leaderboard */}
       <StandingsTab g={g} highlightId={meId} onOpenPlayer={onOpenPlayer} />
@@ -3089,6 +3266,105 @@ function StandingsHome({ g, meId, ownerOf, pname, onOpen, onOpenPlayer }) {
         <span style={{ opacity: 0.4 }}>→</span>
       </button>
     </>
+  );
+}
+
+/* One game on the home-page slate: upcoming, live, or final.
+   Final games expand to show each player's point change from the result. */
+function SlateGame({ g, gm, results, ownerOf, pname, meId }) {
+  const [open, setOpen] = useState(false);
+  const res = results[gm.id];
+  const live = isGameLive(gm, results);
+  const final = !!res;
+  const hOwn = ownerOf(gm.home), aOwn = ownerOf(gm.away);
+  const mine = hOwn === meId || aOwn === meId;
+  const w = final ? winnerOf(res) : null;
+  const drawn = final ? isDraw(res) : false;
+
+  const deltas = useMemo(
+    () => (final ? gamePointDeltas(g, gm.id) : null),
+    [g, gm.id, final, res]
+  );
+  // only players actually affected (non-zero), sorted high to low
+  const affected = deltas
+    ? Object.entries(deltas).map(([id, v]) => ({ id, ...v }))
+        .filter((x) => Math.abs(x.delta) > 0.001)
+        .sort((a, b) => b.delta - a.delta)
+    : [];
+
+  const sideColor = (team) => final && w === team ? S.winB : S.ink;
+  const statusPill = live
+    ? <span style={{ fontSize: 10, fontWeight: 800, color: "#fff", background: "#e5484d",
+        padding: "2px 7px", borderRadius: 999, letterSpacing: "0.05em",
+        display: "inline-flex", alignItems: "center", gap: 4 }}>
+        <span style={{ width: 6, height: 6, borderRadius: 999, background: "#fff",
+          display: "inline-block" }} />LIVE</span>
+    : final
+      ? <span style={{ fontSize: 10.5, fontWeight: 700, opacity: 0.6 }}>FINAL{res.pen ? " (pens)" : ""}</span>
+      : <span style={{ fontSize: 11, opacity: 0.6, fontWeight: 600 }}>{gm.time} ET</span>;
+
+  return (
+    <div style={{ ...card, padding: "11px 14px", marginBottom: 8,
+      borderColor: live ? "#e5484d" : mine ? S.accent : "#222d47" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+        marginBottom: 8 }}>
+        <span style={{ fontSize: 10.5, opacity: 0.5, fontWeight: 700, textTransform: "uppercase",
+          letterSpacing: "0.06em" }}>
+          {gm.stage === "group" ? `Group ${gm.group}` : (STAGES.find((s) => s.key === gm.stage)?.label || gm.stage)}
+        </span>
+        {statusPill}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 17 }}>{FLAG[gm.home]}</span>
+        <span style={{ flex: 1, fontWeight: hOwn === meId ? 800 : 600, fontSize: 14,
+          color: sideColor(gm.home) }}>{gm.home}
+          {hOwn && <span style={{ fontSize: 12.5, fontWeight: 700, color: S.accent }}> · {pname(hOwn)}</span>}
+        </span>
+        {final
+          ? <span style={{ fontWeight: 800, fontSize: 17, fontVariantNumeric: "tabular-nums" }}>
+              {res.h}–{res.a}</span>
+          : <span style={{ opacity: 0.3, fontWeight: 700 }}>vs</span>}
+        <span style={{ flex: 1, textAlign: "right", fontWeight: aOwn === meId ? 800 : 600, fontSize: 14,
+          color: sideColor(gm.away) }}>
+          {aOwn && <span style={{ fontSize: 12.5, fontWeight: 700, color: S.accent }}>{pname(aOwn)} · </span>}
+          {gm.away}</span>
+        <span style={{ fontSize: 17 }}>{FLAG[gm.away]}</span>
+      </div>
+
+      {final && (
+        <>
+          <button onClick={() => setOpen((v) => !v)}
+            style={{ marginTop: 9, width: "100%", background: "transparent",
+              border: "1px solid #222d47", borderRadius: 9, padding: "7px 10px",
+              cursor: "pointer", fontFamily: "inherit", color: S.ink,
+              display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 12, fontWeight: 700 }}>
+              {drawn ? "Draw" : `${w} won`} · points {open ? "" : "›"}
+            </span>
+            <span style={{ fontSize: 11, opacity: 0.5 }}>{open ? "hide" : "show"}</span>
+          </button>
+          {open && (
+            <div style={{ marginTop: 8 }}>
+              {affected.length === 0 ? (
+                <div style={{ fontSize: 12, opacity: 0.5, padding: "4px 2px" }}>
+                  No points changed hands on this game.
+                </div>
+              ) : affected.map((x) => (
+                <div key={x.id} style={{ display: "flex", justifyContent: "space-between",
+                  alignItems: "center", padding: "5px 2px",
+                  borderTop: "1px solid #1b2540" }}>
+                  <span style={{ fontSize: 13, fontWeight: x.id === meId ? 800 : 600 }}>
+                    {x.name}{x.id === meId ? " (you)" : ""}</span>
+                  <span style={{ fontWeight: 800, fontSize: 14, fontVariantNumeric: "tabular-nums",
+                    color: x.delta > 0 ? S.accent : "#ff8095" }}>
+                    {x.delta > 0 ? "+" : ""}{x.delta}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 
