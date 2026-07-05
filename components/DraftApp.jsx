@@ -1,5 +1,5 @@
 "use client";
-// Jingo v3.3 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
+// Jingo v3.4 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
 // summaries, round points) + Jingo home header w/ back button + link-preview ready.
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 
@@ -65,6 +65,22 @@ const DEFAULT_POINTS = Object.fromEntries(STAGES.map((s) => [s.key, s.pts]));
    to every group at once. IDs are stable (r32-N) so re-running is idempotent.
    Teams use the app's canonical names so ownerOf() matches.
 ============================================================================ */
+// Round of 16. R32 complete, matchups locked. home/away follow bracket slots.
+// Official ET kickoffs, July 4-7, 2026.
+const R16_FIXTURES = [
+  { id: "r16-1", home: "Paraguay",    away: "France",   date: "2026-07-04", day: "Sat", time: "5:00 PM" },
+  { id: "r16-2", home: "Canada",      away: "Morocco",  date: "2026-07-04", day: "Sat", time: "1:00 PM" },
+  { id: "r16-3", home: "Portugal",    away: "Spain",    date: "2026-07-06", day: "Mon", time: "3:00 PM" },
+  { id: "r16-4", home: "United States",away: "Belgium", date: "2026-07-06", day: "Mon", time: "8:00 PM" },
+  { id: "r16-5", home: "Brazil",      away: "Norway",   date: "2026-07-05", day: "Sun", time: "4:00 PM" },
+  { id: "r16-6", home: "Mexico",      away: "England",  date: "2026-07-05", day: "Sun", time: "8:00 PM" },
+  { id: "r16-7", home: "Argentina",   away: "Egypt",    date: "2026-07-07", day: "Tue", time: "12:00 PM" },
+  { id: "r16-8", home: "Switzerland", away: "Colombia", date: "2026-07-07", day: "Tue", time: "4:00 PM" },
+];
+const R16_RESULTS = {
+  "r16-2": { h: 0, a: 3, w: "Morocco" },   // Canada 0-3 Morocco
+  "r16-1": { h: 0, a: 1, w: "France" },    // Paraguay 0-1 France
+};
 const R32_FIXTURES = [
   { id: "r32-1",  home: "South Africa", away: "Canada",   date: "2026-06-28", day: "Sun", time: "3:00 PM" },
   { id: "r32-2",  home: "Brazil",       away: "Japan",    date: "2026-06-29", day: "Mon", time: "1:00 PM" },
@@ -1875,6 +1891,7 @@ function groupStageFixtures() {
 // matchups depend on results, so they fall back to whatever's in koGames).
 function knockoutFixtures(stage) {
   if (stage === "r32") return R32_FIXTURES.map((f) => ({ ...f, stage: "r32" }));
+  if (stage === "r16") return R16_FIXTURES.map((f) => ({ ...f, stage: "r16" }));
   return [];
 }
 
