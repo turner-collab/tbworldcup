@@ -1,5 +1,5 @@
 "use client";
-// Jingo v3.4 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
+// Jingo v3.5 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
 // summaries, round points) + Jingo home header w/ back button + link-preview ready.
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 
@@ -78,8 +78,26 @@ const R16_FIXTURES = [
   { id: "r16-8", home: "Switzerland", away: "Colombia", date: "2026-07-07", day: "Tue", time: "4:00 PM" },
 ];
 const R16_RESULTS = {
-  "r16-2": { h: 0, a: 3, w: "Morocco" },   // Canada 0-3 Morocco
-  "r16-1": { h: 0, a: 1, w: "France" },    // Paraguay 0-1 France
+  "r16-1": { h: 0, a: 1, w: "France" },        // Paraguay 0-1 France
+  "r16-2": { h: 0, a: 3, w: "Morocco" },       // Canada 0-3 Morocco
+  "r16-3": { h: 0, a: 1, w: "Spain" },         // Portugal 0-1 Spain
+  "r16-4": { h: 1, a: 4, w: "Belgium" },       // United States 1-4 Belgium
+  "r16-5": { h: 1, a: 2, w: "Norway" },        // Brazil 1-2 Norway
+  "r16-6": { h: 2, a: 3, w: "England" },       // Mexico 2-3 England
+  "r16-7": { h: 3, a: 2, w: "Argentina" },     // Argentina 3-2 Egypt
+  "r16-8": { h: 0, a: 0, w: "Switzerland", pen: true, ph: 4, pa: 3 }, // 0-0, SUI win 4-3 pens
+};
+// Quarterfinals. R16 complete, matchups locked. home/away follow bracket slots
+// qf-1..qf-4. Official ET kickoffs, July 9-11, 2026.
+const QF_FIXTURES = [
+  { id: "qf-1", home: "France",    away: "Morocco",     date: "2026-07-09", day: "Thu", time: "4:00 PM" },
+  { id: "qf-2", home: "Spain",     away: "Belgium",     date: "2026-07-10", day: "Fri", time: "3:00 PM" },
+  { id: "qf-3", home: "Norway",    away: "England",     date: "2026-07-11", day: "Sat", time: "5:00 PM" },
+  { id: "qf-4", home: "Argentina", away: "Switzerland", date: "2026-07-11", day: "Sat", time: "9:00 PM" },
+];
+const QF_RESULTS = {
+  "qf-1": { h: 2, a: 0, w: "France" },   // France 2-0 Morocco
+  "qf-2": { h: 2, a: 1, w: "Spain" },    // Spain 2-1 Belgium
 };
 const R32_FIXTURES = [
   { id: "r32-1",  home: "South Africa", away: "Canada",   date: "2026-06-28", day: "Sun", time: "3:00 PM" },
@@ -1892,6 +1910,7 @@ function groupStageFixtures() {
 function knockoutFixtures(stage) {
   if (stage === "r32") return R32_FIXTURES.map((f) => ({ ...f, stage: "r32" }));
   if (stage === "r16") return R16_FIXTURES.map((f) => ({ ...f, stage: "r16" }));
+  if (stage === "qf") return QF_FIXTURES.map((f) => ({ ...f, stage: "qf" }));
   return [];
 }
 
