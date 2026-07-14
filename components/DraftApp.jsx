@@ -1,5 +1,5 @@
 "use client";
-// Jingo v3.5 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
+// Jingo v3.6 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
 // summaries, round points) + Jingo home header w/ back button + link-preview ready.
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 
@@ -96,9 +96,18 @@ const QF_FIXTURES = [
   { id: "qf-4", home: "Argentina", away: "Switzerland", date: "2026-07-11", day: "Sat", time: "9:00 PM" },
 ];
 const QF_RESULTS = {
-  "qf-1": { h: 2, a: 0, w: "France" },   // France 2-0 Morocco
-  "qf-2": { h: 2, a: 1, w: "Spain" },    // Spain 2-1 Belgium
+  "qf-1": { h: 2, a: 0, w: "France" },      // France 2-0 Morocco
+  "qf-2": { h: 2, a: 1, w: "Spain" },       // Spain 2-1 Belgium
+  "qf-3": { h: 1, a: 2, w: "England" },     // Norway 1-2 England
+  "qf-4": { h: 3, a: 1, w: "Argentina" },   // Argentina 3-1 Switzerland
 };
+// Semifinals. QF complete, matchups locked. home/away follow bracket slots
+// sf-1..sf-2. Official ET kickoffs, July 14-15, 2026.
+const SF_FIXTURES = [
+  { id: "sf-1", home: "France",  away: "Spain",     date: "2026-07-14", day: "Tue", time: "3:00 PM" },
+  { id: "sf-2", home: "England", away: "Argentina", date: "2026-07-15", day: "Wed", time: "3:00 PM" },
+];
+const SF_RESULTS = {};
 const R32_FIXTURES = [
   { id: "r32-1",  home: "South Africa", away: "Canada",   date: "2026-06-28", day: "Sun", time: "3:00 PM" },
   { id: "r32-2",  home: "Brazil",       away: "Japan",    date: "2026-06-29", day: "Mon", time: "1:00 PM" },
@@ -1911,6 +1920,7 @@ function knockoutFixtures(stage) {
   if (stage === "r32") return R32_FIXTURES.map((f) => ({ ...f, stage: "r32" }));
   if (stage === "r16") return R16_FIXTURES.map((f) => ({ ...f, stage: "r16" }));
   if (stage === "qf") return QF_FIXTURES.map((f) => ({ ...f, stage: "qf" }));
+  if (stage === "sf") return SF_FIXTURES.map((f) => ({ ...f, stage: "sf" }));
   return [];
 }
 
