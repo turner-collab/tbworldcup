@@ -1,5 +1,5 @@
 "use client";
-// Jingo v3.6 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
+// Jingo v3.7 — live scores (display-only) + R32 Knockouts page (bracket/group/R32
 // summaries, round points) + Jingo home header w/ back button + link-preview ready.
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 
@@ -107,7 +107,20 @@ const SF_FIXTURES = [
   { id: "sf-1", home: "France",  away: "Spain",     date: "2026-07-14", day: "Tue", time: "3:00 PM" },
   { id: "sf-2", home: "England", away: "Argentina", date: "2026-07-15", day: "Wed", time: "3:00 PM" },
 ];
-const SF_RESULTS = {};
+// Finished SF games (both complete).
+const SF_RESULTS = {
+  "sf-1": { h: 0, a: 2, w: "Spain" },       // France 0-2 Spain
+  "sf-2": { h: 1, a: 2, w: "Argentina" },   // England 1-2 Argentina
+};
+// The Final. SF complete, matchup locked: Spain vs Argentina. home/away follow
+// bracket slot final-1. Official ET kickoff July 19, 2026.
+const FINAL_FIXTURES = [
+  { id: "final-1", home: "Spain", away: "Argentina", date: "2026-07-19", day: "Sun", time: "3:00 PM" },
+];
+// The Final result: Spain 1-0 Argentina (a.e.t., Ferran Torres 106'). Spain champions.
+const FINAL_RESULTS = {
+  "final-1": { h: 1, a: 0, w: "Spain" },
+};
 const R32_FIXTURES = [
   { id: "r32-1",  home: "South Africa", away: "Canada",   date: "2026-06-28", day: "Sun", time: "3:00 PM" },
   { id: "r32-2",  home: "Brazil",       away: "Japan",    date: "2026-06-29", day: "Mon", time: "1:00 PM" },
@@ -1921,6 +1934,7 @@ function knockoutFixtures(stage) {
   if (stage === "r16") return R16_FIXTURES.map((f) => ({ ...f, stage: "r16" }));
   if (stage === "qf") return QF_FIXTURES.map((f) => ({ ...f, stage: "qf" }));
   if (stage === "sf") return SF_FIXTURES.map((f) => ({ ...f, stage: "sf" }));
+  if (stage === "final") return FINAL_FIXTURES.map((f) => ({ ...f, stage: "final" }));
   return [];
 }
 
@@ -3434,6 +3448,11 @@ function PlayerView({ id, phone, playerId, onBack }) {
           <KnockoutTracker g={g} meId={me?.id} ownerOf={ownerOf} pname={pname} />
         </DashSection>
       )}
+      {page === "recap" && (
+        <DashSection title="Tournament Recap" onBack={() => setPage("standings")}>
+          <TournamentRecap g={g} meId={me?.id} ownerOf={ownerOf} pname={pname} />
+        </DashSection>
+      )}
       {showHistory && <DraftHistory g={g} onClose={() => setShowHistory(false)} />}
     </>
   );
@@ -3472,6 +3491,129 @@ function gamePointDeltas(g, gameId) {
     out[r.id] = { name: r.name, delta: Math.round((dMatch + dRival) * 10) / 10 };
   });
   return out;
+}
+
+// Build a cumulative points timeline for the recap graph. For each distinct game
+// DATE that has a played result, compute every player's total standings using
+// only results up to and including that date. Returns { dates:[{label,key}],
+// series:{ playerId: {name, points:[...] } } } with one points value per date.
+function pointsTimeline(g) {
+  const merged = { ...(g.results || {}), ...RESULTS.get() };
+  const allGames = [...groupStageFixtures(), ...(g.koGames || [])];
+  // map gameId -> date string (YYYY-MM-DD); group games use their fixture date.
+  const dateOf = {};
+  allGames.forEach((gm) => { if (gm.date) dateOf[gm.id] = gm.date; });
+  // collect the distinct dates that actually have a played result
+  const playedDates = new Set();
+  Object.keys(merged).forEach((id) => { if (merged[id] && dateOf[id]) playedDates.add(dateOf[id]); });
+  const dates = [...playedDates].sort();
+  // for each cutoff date, filter results to games on/before it, compute standings
+  const series = {};
+  g.players.forEach((p) => { series[p.id] = { name: p.name, points: [] }; });
+  dates.forEach((cut) => {
+    const upto = {};
+    Object.keys(merged).forEach((id) => {
+      const d = dateOf[id];
+      if (d && d <= cut) upto[id] = merged[id];
+    });
+    const rows = computeStandings(g, upto);
+    g.players.forEach((p) => {
+      const r = rows.find((x) => x.id === p.id);
+      series[p.id].points.push(r ? r.total : 0);
+    });
+  });
+  // pretty labels (e.g. "Jun 14")
+  const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const labels = dates.map((d) => {
+    const [y, m, day] = d.split("-").map(Number);
+    return `${MON[m - 1]} ${day}`;
+  });
+  return { dates, labels, series };
+}
+
+// Season rivalry tally: who won/lost their head-to-head rivalry the most. Uses
+// the h2h record already shown on the Rivalries page (your team beats rival's
+// team = +1 you, -1 them, per knockout game and group crossings).
+function rivalryLeaders(g) {
+  const results = { ...(g.results || {}), ...RESULTS.get() };
+  const ownerOf = (team) => g.picks.find((p) => p.team === team)?.playerId;
+  const rivals = g.rivals || {};
+  const allGames = [...groupStageFixtures(), ...(g.koGames || [])];
+  const rec = {}; // playerId -> {w, l}
+  g.players.forEach((p) => { rec[p.id] = { w: 0, l: 0 }; });
+  for (const gm of allGames) {
+    const res = results[gm.id]; if (!res) continue;
+    const w = winnerOf(res); if (!w || isDraw(res)) continue;
+    const loser = gm.home === w ? gm.away : gm.home;
+    const wOwn = ownerOf(w), lOwn = ownerOf(loser);
+    if (!wOwn || !lOwn || wOwn === lOwn) continue;
+    // if winner's owner had loser's owner as rival -> winner's owner +1, loser -1
+    if (rivals[wOwn] === lOwn) { rec[wOwn].w++; rec[lOwn].l++; }
+    // if loser's owner had winner's owner as rival -> also a rivalry crossing
+    else if (rivals[lOwn] === wOwn) { rec[wOwn].w++; rec[lOwn].l++; }
+  }
+  return rec;
+}
+
+// Each team's point contribution to its owner: match points + progression the
+// team earned (the parts attributable to a single team). Used for Steal of the
+// Draft, Biggest Bust, and MVP-per-player. Also returns the team's draft round
+// (1-based) inferred from its position in the snake draft order.
+function teamContributions(g) {
+  const results = { ...(g.results || {}), ...RESULTS.get() };
+  const ownerOf = (team) => g.picks.find((p) => p.team === team)?.playerId;
+  const M = SCORING.mult, D = SCORING.depth, MP = SCORING.match, PR = SCORING.prog;
+  const allGames = [...groupStageFixtures(), ...(g.koGames || [])];
+  const nPlayers = g.players.length || 1;
+
+  // draft round per team from snake-draft pick order (pick index // players)
+  const roundOf = {};
+  g.picks.forEach((p, i) => { roundOf[p.team] = Math.floor(i / nPlayers) + 1; });
+
+  const out = {}; // team -> { team, owner, pts, round, stage }
+  g.picks.forEach((p) => {
+    out[p.team] = { team: p.team, owner: p.playerId, pts: 0, round: roundOf[p.team] || null };
+  });
+
+  // match points per team
+  for (const gm of allGames) {
+    const res = results[gm.id]; if (!res) continue;
+    const mult = M[gm.stage] ?? 1;
+    if (isDraw(res)) {
+      [gm.home, gm.away].forEach((t) => { if (out[t]) out[t].pts += MP.tie * mult; });
+      continue;
+    }
+    const w = winnerOf(res); if (!w) continue;
+    const loser = gm.home === w ? gm.away : gm.home;
+    if (out[w]) out[w].pts += MP.win * mult;
+    if (out[loser]) out[loser].pts += MP.loss * mult;
+  }
+  // progression per team (out of group + each knockout win it achieved)
+  const r32Teams = new Set((g.koGames || []).filter((k) => k.stage === "r32")
+    .flatMap((k) => [k.home, k.away]));
+  Object.keys(out).forEach((t) => { if (r32Teams.has(t)) out[t].pts += PR.outOfGroup; });
+  const koBonus = { r32: PR.winR32, r16: PR.winR16, qf: PR.winQF, sf: PR.reachFinal, final: PR.winFinal };
+  for (const gm of (g.koGames || [])) {
+    const res = results[gm.id]; if (!res) continue;
+    const w = winnerOf(res); if (!w || !out[w]) continue;
+    out[w].pts += koBonus[gm.stage] || 0;
+  }
+  Object.values(out).forEach((o) => { o.pts = Math.round(o.pts * 10) / 10; });
+  return out;
+}
+
+// Rank of each player after each timeline date (1 = first). Built from the same
+// cumulative standings as pointsTimeline. Returns { labels, ranks:{pid:[...]} }.
+function positionTimeline(g) {
+  const tl = pointsTimeline(g);
+  const ranks = {};
+  g.players.forEach((p) => { ranks[p.id] = []; });
+  tl.labels.forEach((_, i) => {
+    const snapshot = g.players.map((p) => ({ id: p.id, pts: tl.series[p.id].points[i] }))
+      .sort((a, b) => b.pts - a.pts);
+    snapshot.forEach((s, idx) => { ranks[s.id].push(idx + 1); });
+  });
+  return { labels: tl.labels, ranks, series: tl.series };
 }
 
 function StandingsHome({ g, meId, ownerOf, pname, onOpen, onOpenPlayer }) {
@@ -3519,9 +3661,26 @@ function StandingsHome({ g, meId, ownerOf, pname, onOpen, onOpenPlayer }) {
       {/* Leaderboard */}
       <StandingsTab g={g} highlightId={meId} onOpenPlayer={onOpenPlayer} />
 
+      {/* Tournament Recap button — shows once the Final has a result */}
+      {merged["final-1"] && (
+        <button onClick={() => onOpen("recap")}
+          style={{ width: "100%", marginTop: 18, padding: "18px 16px",
+            cursor: "pointer", fontFamily: "inherit", color: "#0b1020",
+            display: "flex", alignItems: "center", gap: 12, border: "none",
+            borderRadius: 16,
+            background: "linear-gradient(120deg, #ffd54a 0%, #ffb020 55%, #ff8f3f 100%)",
+            boxShadow: "0 6px 24px rgba(255,176,32,0.35)" }}>
+          <span style={{ fontSize: 26 }}>🏆</span>
+          <div style={{ textAlign: "left", flex: 1 }}>
+            <div style={{ fontWeight: 900, fontSize: 17, letterSpacing: "-0.01em" }}>Tournament Recap</div>
+          </div>
+          <span style={{ opacity: 0.5, fontWeight: 800 }}>→</span>
+        </button>
+      )}
+
       {/* Knockouts button */}
       <button onClick={() => onOpen("knockout")}
-        style={{ ...card, width: "100%", marginTop: 18, padding: "16px",
+        style={{ ...card, width: "100%", marginTop: 10, padding: "16px",
           cursor: "pointer", fontFamily: "inherit", color: "inherit",
           display: "flex", alignItems: "center", gap: 12, border: `1px solid ${S.accent}` }}>
         <span style={{ fontSize: 24 }}>🏆</span>
@@ -4322,6 +4481,319 @@ function round1(n) { return Math.round(n * 10) / 10; }
 /* Rivalries page: each player vs their rival, with head-to-head match record. */
 /* Knockout Tracker: live bracket (owner names + flags) and a group-stage
    summary of how each player's teams fared getting out of the groups. */
+/* Tournament Recap: the end-of-tournament victory page. Champion banner, a
+   cumulative points-over-time line chart, rivalry record, and superlatives. */
+function TournamentRecap({ g, meId, ownerOf, pname }) {
+  const rows = useMemo(() => computeStandings(g), [g]);
+  const timeline = useMemo(() => pointsTimeline(g), [g]);
+  const rivalRec = useMemo(() => rivalryLeaders(g), [g]);
+  const results = { ...(g.results || {}), ...RESULTS.get() };
+
+  if (rows.length === 0) return null;
+  const champ = rows[0];
+  const last = rows[rows.length - 1];
+  const isMe = (id) => id === meId;
+
+  // line colors per player (stable by index)
+  const LINE = ["#3ddc97", "#2498da", "#ffb020", "#ff6b8a", "#b98cff", "#4be0d0", "#f7a072", "#9ccc65"];
+  const colorOf = {};
+  g.players.forEach((p, i) => { colorOf[p.id] = LINE[i % LINE.length]; });
+
+  // who won the World Cup team-wise (final winner)
+  const finalRes = results["final-1"];
+  const worldChamp = finalRes ? winnerOf(finalRes) : null;
+  const champOwner = worldChamp ? ownerOf(worldChamp) : null;
+
+  // rivalry leader (best net record) and worst
+  const rivalArr = g.players.map((p) => ({ id: p.id, name: p.name, ...rivalRec[p.id],
+    net: rivalRec[p.id].w - rivalRec[p.id].l }));
+  const bestRival = [...rivalArr].sort((a, b) => b.net - a.net)[0];
+  const worstRival = [...rivalArr].sort((a, b) => a.net - b.net)[0];
+
+  // biggest single mover: largest points gain on any one date
+  let biggestJump = null;
+  Object.values(timeline.series).forEach((s) => {
+    for (let i = 1; i < s.points.length; i++) {
+      const gain = s.points[i] - s.points[i - 1];
+      if (!biggestJump || gain > biggestJump.gain) {
+        biggestJump = { name: s.name, gain: Math.round(gain * 10) / 10, label: timeline.labels[i] };
+      }
+    }
+  });
+
+  // ----- team-level stats: steal, bust, MVP per player -----
+  const contribs = useMemo(() => teamContributions(g), [g]);
+  const contribArr = Object.values(contribs);
+  // Steal of the Draft: best points-per-round (late pick, big return). Only teams
+  // drafted in round >= 4 qualify so an early stud isn't the "steal".
+  const stealPool = contribArr.filter((c) => c.round && c.round >= 4 && c.pts > 0);
+  const steal = stealPool.sort((a, b) => (b.pts / b.round) - (a.pts / a.round))[0]
+    || contribArr.slice().sort((a, b) => b.pts - a.pts)[0];
+  // Biggest Bust: earliest pick (round 1-3) with the lowest points.
+  const bustPool = contribArr.filter((c) => c.round && c.round <= 3);
+  const bust = bustPool.sort((a, b) => a.pts - b.pts)[0];
+  // MVP team per player: each player's single highest-scoring team.
+  const mvpByPlayer = {};
+  contribArr.forEach((c) => {
+    if (!mvpByPlayer[c.owner] || c.pts > mvpByPlayer[c.owner].pts) mvpByPlayer[c.owner] = c;
+  });
+
+  // ----- position-over-time stats: comeback, lead changes, time in first -----
+  const posTL = useMemo(() => positionTimeline(g), [g]);
+  // Biggest comeback: most rank positions climbed from a player's worst rank to final.
+  let comeback = null;
+  g.players.forEach((p) => {
+    const r = posTL.ranks[p.id]; if (!r || r.length === 0) return;
+    const worst = Math.max(...r);
+    const final = r[r.length - 1];
+    const climb = worst - final;
+    if (!comeback || climb > comeback.climb) {
+      comeback = { name: p.name, climb, from: worst, to: final };
+    }
+  });
+  // Longest time in first: count timeline points each player spent at rank 1.
+  const daysFirst = {};
+  g.players.forEach((p) => {
+    daysFirst[p.id] = posTL.ranks[p.id].filter((rk) => rk === 1).length;
+  });
+  const mostFirst = g.players.map((p) => ({ id: p.id, name: p.name, n: daysFirst[p.id] }))
+    .sort((a, b) => b.n - a.n)[0];
+
+  // ----- group-stage hero: most points earned during the group stage -----
+  const groupPts = useMemo(() => roundPoints(g, "group"), [g]);
+  const groupHero = g.players.map((p) => ({ id: p.id, name: p.name, pts: groupPts[p.id]?.total || 0 }))
+    .sort((a, b) => b.pts - a.pts)[0];
+
+  const pnameOf = (pid) => (g.players.find((p) => p.id === pid) || {}).name || "—";
+
+  // ----- SVG line chart geometry -----
+  const W = 320, H = 200, padL = 34, padR = 12, padT = 14, padB = 26;
+  const nPts = timeline.labels.length;
+  const allVals = Object.values(timeline.series).flatMap((s) => s.points);
+  const maxY = Math.max(10, ...allVals);
+  const minY = Math.min(0, ...allVals);
+  const x = (i) => padL + (nPts <= 1 ? 0 : (i / (nPts - 1)) * (W - padL - padR));
+  const y = (v) => padT + (1 - (v - minY) / (maxY - minY || 1)) * (H - padT - padB);
+  const pathFor = (pts) => pts.map((v, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  // y gridlines
+  const yTicks = 4;
+  const gridVals = Array.from({ length: yTicks + 1 }, (_, i) => minY + (i / yTicks) * (maxY - minY));
+
+  const Stat = ({ emoji, title, name, detail, color }) => (
+    <div style={{ ...card, padding: "13px 15px", display: "flex", alignItems: "center", gap: 12 }}>
+      <span style={{ fontSize: 26 }}>{emoji}</span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 10.5, opacity: 0.5, fontWeight: 700, textTransform: "uppercase",
+          letterSpacing: "0.06em" }}>{title}</div>
+        <div style={{ fontWeight: 800, fontSize: 16, color: color || S.ink }}>{name}</div>
+        {detail && <div style={{ fontSize: 12, opacity: 0.6 }}>{detail}</div>}
+      </div>
+    </div>
+  );
+
+  return (
+    <>
+      {/* CHAMPION BANNER */}
+      <div style={{ borderRadius: 20, padding: "26px 20px", marginBottom: 16, textAlign: "center",
+        background: "radial-gradient(120% 140% at 50% 0%, #2a2140 0%, #141b2e 60%)",
+        border: `1px solid ${S.accent}`, position: "relative", overflow: "hidden" }}>
+        <div style={{ fontSize: 13, letterSpacing: "0.18em", textTransform: "uppercase",
+          opacity: 0.6, fontWeight: 700 }}>League Champion</div>
+        <div style={{ fontSize: 58, margin: "6px 0 2px" }}>🏆</div>
+        <div style={{ fontWeight: 900, fontSize: 40, lineHeight: 1.05, letterSpacing: "-0.02em",
+          color: S.accent }}>{champ.name}{isMe(champ.id) ? " 🎉" : ""}</div>
+        <div style={{ fontSize: 15, opacity: 0.8, marginTop: 6, fontWeight: 600 }}>
+          {champ.total} points{isMe(champ.id) ? " · that's you!" : ""}</div>
+        {rows[1] && (
+          <div style={{ fontSize: 12.5, opacity: 0.55, marginTop: 4 }}>
+            won by {Math.round((champ.total - rows[1].total) * 10) / 10} over {rows[1].name}
+          </div>
+        )}
+      </div>
+
+      {/* WORLD CUP CHAMP (team) + who owned them */}
+      {worldChamp && (
+        <div style={{ ...card, marginBottom: 16, display: "flex", alignItems: "center", gap: 12,
+          borderColor: S.accent }}>
+          <span style={{ fontSize: 30 }}>{FLAG[worldChamp]}</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 10.5, opacity: 0.5, fontWeight: 700, textTransform: "uppercase",
+              letterSpacing: "0.06em" }}>World Cup Winner</div>
+            <div style={{ fontWeight: 800, fontSize: 17 }}>{worldChamp} lifted the trophy</div>
+            {champOwner && <div style={{ fontSize: 12.5, opacity: 0.65 }}>
+              drafted by <b style={{ color: S.accent }}>{pname(champOwner)}</b></div>}
+          </div>
+        </div>
+      )}
+
+      {/* POINTS OVER TIME CHART */}
+      <div style={{ ...card, marginBottom: 16 }}>
+        <div style={{ ...lbl, marginBottom: 4 }}>Race for the title</div>
+        <div style={{ fontSize: 12, opacity: 0.55, marginBottom: 10 }}>
+          Cumulative points through the tournament.
+        </div>
+        <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+          {/* gridlines + y labels */}
+          {gridVals.map((v, i) => (
+            <g key={i}>
+              <line x1={padL} y1={y(v)} x2={W - padR} y2={y(v)} stroke="#26304a" strokeWidth="1" />
+              <text x={padL - 5} y={y(v) + 3} textAnchor="end" fontSize="8" fill="#7f8db0">
+                {Math.round(v)}</text>
+            </g>
+          ))}
+          {/* x labels (first, middle, last to avoid crowding) */}
+          {timeline.labels.map((lab, i) => {
+            const show = i === 0 || i === nPts - 1 || i === Math.floor((nPts - 1) / 2);
+            if (!show) return null;
+            return <text key={i} x={x(i)} y={H - 8} textAnchor="middle" fontSize="8" fill="#7f8db0">{lab}</text>;
+          })}
+          {/* one line per player */}
+          {g.players.map((p) => {
+            const s = timeline.series[p.id];
+            if (!s || s.points.length === 0) return null;
+            const mine = isMe(p.id);
+            return (
+              <path key={p.id} d={pathFor(s.points)} fill="none"
+                stroke={colorOf[p.id]} strokeWidth={mine ? 3 : 2}
+                strokeLinejoin="round" strokeLinecap="round"
+                opacity={mine ? 1 : 0.85} />
+            );
+          })}
+          {/* end dots */}
+          {g.players.map((p) => {
+            const s = timeline.series[p.id];
+            if (!s || s.points.length === 0) return null;
+            const li = s.points.length - 1;
+            return <circle key={p.id} cx={x(li)} cy={y(s.points[li])} r={mineR(isMe(p.id))}
+              fill={colorOf[p.id]} />;
+          })}
+        </svg>
+        {/* legend */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 14px", marginTop: 10 }}>
+          {rows.map((r) => (
+            <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ width: 12, height: 3, borderRadius: 2, background: colorOf[r.id],
+                display: "inline-block" }} />
+              <span style={{ fontSize: 12, fontWeight: isMe(r.id) ? 800 : 600,
+                color: isMe(r.id) ? S.accent : S.ink }}>
+                {r.name} · {r.total}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* DRAFT REPORT — team-level bragging rights */}
+      <div style={{ ...lbl, marginBottom: 8 }}>Draft Report</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+        {steal && (
+          <div style={{ ...card, padding: "13px 15px", display: "flex", alignItems: "center", gap: 12 }}>
+            <span style={{ fontSize: 26 }}>💎</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 10.5, opacity: 0.5, fontWeight: 700, textTransform: "uppercase",
+                letterSpacing: "0.06em" }}>Steal of the Draft</div>
+              <div style={{ fontWeight: 800, fontSize: 16 }}>
+                <span style={{ marginRight: 5 }}>{FLAG[steal.team]}</span>{steal.team}</div>
+              <div style={{ fontSize: 12, opacity: 0.65 }}>
+                {steal.pts} pts from a round {steal.round} pick · {pnameOf(steal.owner)}</div>
+            </div>
+          </div>
+        )}
+        {bust && (
+          <div style={{ ...card, padding: "13px 15px", display: "flex", alignItems: "center", gap: 12 }}>
+            <span style={{ fontSize: 26 }}>💸</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 10.5, opacity: 0.5, fontWeight: 700, textTransform: "uppercase",
+                letterSpacing: "0.06em" }}>Biggest Bust</div>
+              <div style={{ fontWeight: 800, fontSize: 16, color: "#ff8095" }}>
+                <span style={{ marginRight: 5 }}>{FLAG[bust.team]}</span>{bust.team}</div>
+              <div style={{ fontSize: 12, opacity: 0.65 }}>
+                only {bust.pts} pts from a round {bust.round} pick · {pnameOf(bust.owner)}</div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* MVP TEAM PER PLAYER */}
+      <div style={{ ...lbl, marginBottom: 8 }}>Each Player's MVP Team</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>
+        {rows.map((r) => {
+          const mvp = mvpByPlayer[r.id];
+          if (!mvp) return null;
+          return (
+            <div key={r.id} style={{ ...card, padding: "10px 14px", display: "flex",
+              alignItems: "center", gap: 10 }}>
+              <span style={{ fontWeight: 700, fontSize: 13.5, width: 70, flexShrink: 0,
+                color: isMe(r.id) ? S.accent : S.ink }}>{r.name}</span>
+              <span style={{ fontSize: 18 }}>{FLAG[mvp.team]}</span>
+              <span style={{ flex: 1, fontWeight: 600, fontSize: 14 }}>{mvp.team}</span>
+              <span style={{ fontWeight: 800, fontSize: 14, color: S.accent,
+                fontVariantNumeric: "tabular-nums" }}>{mvp.pts}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* SUPERLATIVES */}
+      <div style={{ ...lbl, marginBottom: 8 }}>Superlatives</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+        <Stat emoji="🥊" title="Rivalry King" name={bestRival.name}
+          detail={`${bestRival.w}–${bestRival.l} in rivalry games (+${bestRival.net})`}
+          color={S.accent} />
+        {worstRival.id !== bestRival.id && (
+          <Stat emoji="🤕" title="Rivalry Punching Bag" name={worstRival.name}
+            detail={`${worstRival.w}–${worstRival.l} in rivalry games (${worstRival.net})`}
+            color="#ff8095" />
+        )}
+        {groupHero && (
+          <Stat emoji="🌱" title="Group Stage Hero" name={groupHero.name}
+            detail={`${Math.round(groupHero.pts)} points banked in the group stage`} />
+        )}
+        {comeback && comeback.climb > 0 && (
+          <Stat emoji="📈" title="Biggest Comeback" name={comeback.name}
+            detail={`climbed from ${ordinal(comeback.from)} to ${ordinal(comeback.to)}`}
+            color={S.accent} />
+        )}
+        {mostFirst && mostFirst.n > 0 && (
+          <Stat emoji="👑" title="Longest Time in First" name={mostFirst.name}
+            detail={`led the table on ${mostFirst.n} of ${posTL.labels.length} matchdays`} />
+        )}
+        {biggestJump && (
+          <Stat emoji="🚀" title="Biggest Single Day" name={biggestJump.name}
+            detail={`+${biggestJump.gain} points on ${biggestJump.label}`} />
+        )}
+        <Stat emoji="🪑" title="Wooden Spoon (last place)" name={last.name}
+          detail={`${last.total} points`} color="#9fb0d0" />
+      </div>
+
+      {/* FINAL STANDINGS */}
+      <div style={{ ...lbl, marginBottom: 8 }}>Final Standings</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {rows.map((r, i) => (
+          <div key={r.id} style={{ ...card, padding: "11px 14px", display: "flex",
+            alignItems: "center", gap: 12,
+            borderColor: i === 0 ? S.accent : isMe(r.id) ? "#3a4566" : "#222d47" }}>
+            <span style={{ fontSize: 18, fontWeight: 900, width: 26, textAlign: "center",
+              color: i === 0 ? S.accent : S.ink, opacity: i === 0 ? 1 : 0.45 }}>
+              {i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : i + 1}</span>
+            <span style={{ flex: 1, fontWeight: isMe(r.id) ? 800 : 600, fontSize: 15,
+              color: isMe(r.id) ? S.accent : S.ink }}>
+              {r.name}{isMe(r.id) ? " (you)" : ""}</span>
+            <span style={{ fontWeight: 800, fontSize: 16, fontVariantNumeric: "tabular-nums" }}>
+              {r.total}</span>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+// small helper: end-dot radius (bigger for the current user's line)
+function mineR(mine) { return mine ? 4 : 3; }
+// ordinal: 1 -> "1st", 2 -> "2nd", etc.
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
 function KnockoutTracker({ g, meId, ownerOf, pname }) {
   const [tab, setTab] = useState("bracket");
   const results = { ...(g.results || {}), ...RESULTS.get() };
